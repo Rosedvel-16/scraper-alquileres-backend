@@ -5,21 +5,29 @@ from typing import List, Optional
 from datetime import datetime
 import logging
 from scraper import run_scrapers
+from fastapi.middleware.cors import CORSMiddleware
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Scraper de Alquileres API", version="1.0.0")
+app = FastAPI(title="Scraper de Alquileres API", version="2.1.0")
 
-# Configurar CORS
+
+FRONTEND_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://scraper-alquileres-frontend.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 class Property(BaseModel):
     id: str
