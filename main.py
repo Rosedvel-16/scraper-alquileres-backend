@@ -1,18 +1,18 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Tuple
-from datetime import datetime
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime, timedelta
 import logging
+import threading
 
-# Import perezoso dentro de la función, pero dejamos el import aquí si prefieres eager:
-from scraper import run_scrapers 
+from scraper import run_scrapers  # tu función existente
 
 # ----------------- Logging -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Scraper de Alquileres API", version="2.2.1")
+app = FastAPI(title="Scraper de Alquileres API", version="2.3.0")
 
 # ----------------- CORS -----------------
 FRONTEND_ORIGINS = [
@@ -20,11 +20,10 @@ FRONTEND_ORIGINS = [
     "http://127.0.0.1:3000",
     "https://scraper-alquileres-frontend.vercel.app",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",  # para previas de Vercel
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,7 +31,7 @@ app.add_middleware(
 
 # ----------------- Paginación -----------------
 DEFAULT_PAGE_SIZE = 20
-MAX_PAGE_SIZE = 20  # 🔒 tope duro de 20 por página
+MAX_PAGE_SIZE = 20  # tope duro 20
 
 # ----------------- Modelos -----------------
 class Property(BaseModel):
@@ -47,6 +46,8 @@ class Property(BaseModel):
     fuente: str
     scraped_at: str
     imagen_url: str
+    # Nuevo: para marcar 1 destacado por página (opcional)
+    is_featured: Optional[bool] = False
 
 class PaginationMeta(BaseModel):
     page: int
@@ -66,9 +67,9 @@ class SearchRequest(BaseModel):
 
 class SearchResponse(BaseModel):
     success: bool
-    count: int                      # elementos en esta página
-    properties: List[Property]      # subset paginado
-    meta: PaginationMeta            # metadatos globales
+    count: int
+    properties: List[Property]
+    meta: PaginationMeta
     message: Optional[str] = None
 
 # ----------------- Helpers -----------------
@@ -83,7 +84,6 @@ def clamp_page(page: Optional[int]) -> int:
 def paginate(items: List[dict], page: int, page_size: int) -> Tuple[List[dict], PaginationMeta]:
     total = len(items)
     total_pages = max(1, (total + page_size - 1) // page_size)
-    # si piden página > total_pages, se ajusta a la última
     if page > total_pages:
         page = total_pages
     start = (page - 1) * page_size
@@ -107,7 +107,6 @@ def run_search(
     price_max: Optional[int],
     palabras_clave: str,
 ) -> List[dict]:
-    """Ejecuta los scrapers y normaliza a list[dict]."""
     results = run_scrapers(
         zona=zona,
         dormitorios=dormitorios,
@@ -116,16 +115,93 @@ def run_search(
         price_max=price_max,
         palabras_clave=palabras_clave
     )
-
     if results is None:
         return []
-
-    # Soportar DataFrame o lista de dicts
     if hasattr(results, "to_dict"):
         return results.to_dict("records")
     if isinstance(results, list):
         return results
     return []
+
+# ----------------- Destacado por página -----------------
+FEATURE_KEYWORDS = ["piscina", "mascota", "mascotas", "cochera", "terraza", "balcon", "ascensor", "gimnasio", "amoblado"]
+
+def score_property(p: Dict[str, Any]) -> float:
+    """Heurística simple (datos reales): más puntos si tiene amenities y si el precio es bajo."""
+    score = 0.0
+    text = f"{p.get('titulo','')} {p.get('descripcion','')}".lower()
+    for kw in FEATURE_KEYWORDS:
+        if kw in text:
+            score += 1.0
+    # bonifica precios en S/ más bajos (si se puede parsear)
+    import re
+    s = str(p.get("precio",""))
+    nums = re.sub(r"[^\d]", "", s)
+    if s.strip().startswith("S") and nums:
+        try:
+            val = int(nums)
+            # mapeo simple: 2000 => +1.0, 1000 => +2.0 (cuanto más bajo, más score)
+            score += max(0.0, 3000.0 / max(val, 1))
+        except:
+            pass
+    return score
+
+def mark_featured_one(items: List[dict]) -> List[dict]:
+    """Marca exactamente 1 item con is_featured=True si hay elementos."""
+    if not items:
+        return items
+    best_idx = None
+    best_score = -1e9
+    for i, p in enumerate(items):
+        sc = score_property(p)
+        if sc > best_score:
+            best_score = sc
+            best_idx = i
+    for i, p in enumerate(items):
+        p["is_featured"] = (i == best_idx)
+    return items
+
+# ----------------- Métricas de búsquedas (trending) -----------------
+SEARCH_STATS: Dict[str, int] = {}
+STATS_LOCK = threading.Lock()
+
+def _stats_key(zona: str, dormitorios: str, banos: str, price_min: Optional[int], price_max: Optional[int], palabras_clave: str) -> str:
+    zona = (zona or "").strip().lower()
+    dormitorios = str(dormitorios or "0")
+    banos = str(banos or "0")
+    pmin = "" if price_min is None else str(price_min)
+    pmax = "" if price_max is None else str(price_max)
+    palabras = (palabras_clave or "").strip().lower()
+    return f"{zona}|{dormitorios}|{banos}|{pmin}|{pmax}|{palabras}"
+
+def record_search(zona: str, dormitorios: str, banos: str, price_min: Optional[int], price_max: Optional[int], palabras_clave: str):
+    key = _stats_key(zona, dormitorios, banos, price_min, price_max, palabras_clave)
+    with STATS_LOCK:
+        SEARCH_STATS[key] = SEARCH_STATS.get(key, 0) + 1
+
+def parse_stats_key(key: str) -> Dict[str, Any]:
+    zona, dormitorios, banos, pmin, pmax, palabras = key.split("|")
+    return {
+        "zona": zona,
+        "dormitorios": dormitorios if dormitorios else "0",
+        "banos": banos if banos else "0",
+        "price_min": int(pmin) if pmin else None,
+        "price_max": int(pmax) if pmax else None,
+        "palabras_clave": palabras or ""
+    }
+
+# ----------------- Cache simple con TTL para home-feed -----------------
+HOME_CACHE: Dict[str, Any] = {"expires": datetime.min, "payload": None}
+HOME_CACHE_TTL = timedelta(minutes=15)
+
+def get_home_cached() -> Optional[dict]:
+    if HOME_CACHE["payload"] and datetime.utcnow() < HOME_CACHE["expires"]:
+        return HOME_CACHE["payload"]
+    return None
+
+def set_home_cached(payload: dict):
+    HOME_CACHE["payload"] = payload
+    HOME_CACHE["expires"] = datetime.utcnow() + HOME_CACHE_TTL
 
 # ----------------- Rutas básicas -----------------
 @app.get("/")
@@ -141,9 +217,9 @@ async def list_sources():
     sources = ["nestoria", "infocasas", "urbania", "properati", "doomos"]
     return {"sources": sources}
 
-# ----------------- Endpoints de búsqueda (con paginación) -----------------
+# ----------------- Endpoints de búsqueda (con paginación + destacado) -----------------
 @app.post("/search", response_model=SearchResponse)
-async def search_properties(
+async def search_properties_post(
     request: SearchRequest,
     page: int = Query(1, ge=1, description="Página 1-based"),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Tamaño de página (máx 20)")
@@ -151,6 +227,9 @@ async def search_properties(
     try:
         page = clamp_page(page)
         page_size = clamp_page_size(page_size)
+
+        # registrar en trending
+        record_search(request.zona, request.dormitorios or "0", request.banos or "0", request.price_min, request.price_max, request.palabras_clave or "")
 
         properties_all = run_search(
             zona=request.zona,
@@ -162,40 +241,41 @@ async def search_properties(
         )
 
         if not properties_all:
-            empty_meta = PaginationMeta(
-                page=1, page_size=page_size, total=0, total_pages=1, has_prev=False, has_next=False
-            )
+            empty_meta = PaginationMeta(page=1, page_size=page_size, total=0, total_pages=1, has_prev=False, has_next=False)
             return SearchResponse(success=True, count=0, properties=[], meta=empty_meta,
                                   message="No se encontraron propiedades que coincidan con los criterios")
 
         page_items, meta = paginate(properties_all, page, page_size)
+        page_items = mark_featured_one(page_items)  # ✅ 1 destacado por página (datos reales)
 
         return SearchResponse(
             success=True,
             count=len(page_items),
-            properties=page_items,
+            properties=page_items,  # contiene is_featured
             meta=meta,
             message=f"Se encontraron {meta.total} propiedades"
         )
-
     except Exception as e:
         logger.exception("Error en búsqueda POST")
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
 
 @app.get("/search", response_model=SearchResponse)
 async def search_properties_get(
-    zona: str = Query(..., description="Zona a buscar (ej: miraflores, san isidro)"),
-    dormitorios: str = Query("0", description="Número de dormitorios (0 para cualquier)"),
-    banos: str = Query("0", description="Número de baños (0 para cualquier)"),
-    price_min: Optional[int] = Query(None, description="Precio mínimo en soles"),
-    price_max: Optional[int] = Query(None, description="Precio máximo en soles"),
-    palabras_clave: str = Query("", description="Palabras clave para filtrar (ej: 'piscina mascotas')"),
+    zona: str = Query(..., description="Zona a buscar"),
+    dormitorios: str = Query("0", description="Número de dormitorios (0 = cualquiera)"),
+    banos: str = Query("0", description="Número de baños (0 = cualquiera)"),
+    price_min: Optional[int] = Query(None, description="Precio mínimo (S/)"),
+    price_max: Optional[int] = Query(None, description="Precio máximo (S/)"),
+    palabras_clave: str = Query("", description="Palabras clave (ej: 'piscina mascotas')"),
     page: int = Query(1, ge=1, description="Página 1-based"),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Tamaño de página (máx 20)")
 ):
     try:
         page = clamp_page(page)
         page_size = clamp_page_size(page_size)
+
+        # registrar en trending
+        record_search(zona, dormitorios, banos, price_min, price_max, palabras_clave)
 
         properties_all = run_search(
             zona=zona,
@@ -207,13 +287,12 @@ async def search_properties_get(
         )
 
         if not properties_all:
-            empty_meta = PaginationMeta(
-                page=1, page_size=page_size, total=0, total_pages=1, has_prev=False, has_next=False
-            )
+            empty_meta = PaginationMeta(page=1, page_size=page_size, total=0, total_pages=1, has_prev=False, has_next=False)
             return SearchResponse(success=True, count=0, properties=[], meta=empty_meta,
                                   message="No se encontraron propiedades que coincidan con los criterios")
 
         page_items, meta = paginate(properties_all, page, page_size)
+        page_items = mark_featured_one(page_items)  # ✅ 1 destacado por página
 
         return SearchResponse(
             success=True,
@@ -222,10 +301,81 @@ async def search_properties_get(
             meta=meta,
             message=f"Se encontraron {meta.total} propiedades"
         )
-
     except Exception as e:
         logger.exception("Error en búsqueda GET")
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+
+# ----------------- Endpoint: consultas más buscadas -----------------
+@app.get("/trending")
+async def trending(limit: int = Query(6, ge=1, le=20)):
+    """Devuelve combinaciones de búsqueda reales, ordenadas por frecuencia."""
+    with STATS_LOCK:
+        items = sorted(SEARCH_STATS.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    payload = []
+    for key, count in items:
+        parsed = parse_stats_key(key)
+        parsed["count"] = count
+        payload.append(parsed)
+    return {"items": payload, "generated_at": datetime.utcnow().isoformat()}
+
+# ----------------- Endpoint: home-feed (resultados reales para la portada) -----------------
+@app.get("/home-feed")
+async def home_feed():
+    """
+    Entrega secciones con resultados REALES para la home:
+      - Toma top búsquedas reales si existen (SEARCH_STATS), si no usa un fallback fijo.
+      - Para cada sección, trae 6 resultados (page=1, page_size=6) y cachea por 15 min.
+    """
+    cached = get_home_cached()
+    if cached:
+        return cached
+
+    # 1) Decide queries base (top trending o fallback)
+    with STATS_LOCK:
+        sorted_stats = sorted(SEARCH_STATS.items(), key=lambda kv: kv[1], reverse=True)
+    base_queries = []
+    for key, _ in sorted_stats[:3]:  # top 3
+        base_queries.append(parse_stats_key(key))
+
+    if not base_queries:
+        # Fallback determinista (sin inventar): zonas comunes
+        base_queries = [
+            {"zona": "miraflores", "dormitorios": "0", "banos": "0", "price_min": None, "price_max": None, "palabras_clave": ""},
+            {"zona": "san isidro", "dormitorios": "0", "banos": "0", "price_min": None, "price_max": None, "palabras_clave": ""},
+            {"zona": "santiago de surco", "dormitorios": "0", "banos": "0", "price_min": None, "price_max": None, "palabras_clave": ""},
+        ]
+
+    # 2) Ejecuta búsquedas (reales) y arma secciones
+    sections = []
+    for q in base_queries:
+        try:
+            all_items = run_search(
+                zona=q["zona"],
+                dormitorios=q["dormitorios"],
+                banos=q["banos"],
+                price_min=q["price_min"],
+                price_max=q["price_max"],
+                palabras_clave=q["palabras_clave"]
+            )
+            # corta a 6 y marca 1 destacado en esa mini-lista
+            subset = all_items[:6]
+            subset = mark_featured_one(subset)
+            sections.append({
+                "title": f"{q['zona'].title()}",
+                "query": q,
+                "count": len(subset),
+                "properties": subset
+            })
+        except Exception as e:
+            logger.warning(f"home-feed sección falló para {q}: {e}")
+
+    payload = {
+        "sections": sections,
+        "generated_at": datetime.utcnow().isoformat(),
+        "cached_ttl_minutes": int(HOME_CACHE_TTL.total_seconds() // 60)
+    }
+    set_home_cached(payload)
+    return payload
 
 # ----------------- Ejecución local -----------------
 if __name__ == "__main__":
@@ -233,9 +383,4 @@ if __name__ == "__main__":
     print("🚀 Iniciando servidor FastAPI...")
     print("📍 URL: http://localhost:8000")
     print("📚 Documentación: http://localhost:8000/docs")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
