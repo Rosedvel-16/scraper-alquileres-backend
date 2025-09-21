@@ -1,4 +1,17 @@
-# ----------- Librerías ----------
+# -*- coding: utf-8 -*-
+"""
+Scraper completo: Nestoria, Infocasas, Urbania, Properati, Doomos
+Filtros opcionales: zona, dormitorios, baños, price_min, price_max, palabras_clave
+Salida: DataFrame combinado (mostrado) + CSV (combined_anuncios_filtrados.csv)
+"""
+import re
+import time
+import os
+import requests
+import pandas as pd
+from typing import Optional, List, Dict, Any
+from bs4 import BeautifulSoup
+# Selenium (solo para otros scrapers, no para Nestoria)
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -6,61 +19,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-from bs4 import BeautifulSoup
-import pandas as pd
-import re
-import time
-import os
-import requests
-import unicodedata
-import json
-import logging
-from typing import List, Dict, Optional
-from datetime import datetime
-import uuid
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+COMMON_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 
-# ----------- Helpers -----------
-EXCEPCIONES = ["miraflores", "tarapoto", "la molina", "magdalena", "lambayeque", "ventanilla", "la victoria"]
-
-def normalize_text(text):
-    """Elimina acentos y pasa a minúsculas"""
-    if not text:
-        return ""
-    return unicodedata.normalize('NFKD', text.lower()).encode('ASCII','ignore').decode('utf-8')
-
-def build_zona_slug_nestoria(zona_input: str) -> str:
-    z = zona_input.strip().lower().replace(" ", "-")
-    if z not in [e.lower() for e in EXCEPCIONES]:
-        return z
-    else:
-        return "lima_" + z
-
-def parse_precio_con_moneda(precio_str):
-    if not precio_str:
-        return (None, None)
-    s = precio_str.strip()
-    if "S/" in s or "S/." in s or s.startswith("S/") or s.startswith("S/."):
-        moneda = "S"
-    elif "$" in s:
-        moneda = "USD"
-    else:
-        moneda = None
-    nums = re.sub(r"[^\d]", "", s)
-    if nums == "":
-        return (moneda, None)
-    try:
-        return (moneda, int(nums))
-    except:
-        return (moneda, None)
-
-# ---------- Configuración del Driver ----------
-COMMON_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-
-def create_driver(headless=True):
+# -------------------- Helpers --------------------
+def create_driver(headless: bool = True):
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -68,967 +32,1019 @@ def create_driver(headless=True):
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--remote-debugging-port=9222")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
-    except:
+    except Exception:
         pass
     return driver
-
-# ---------- Scrapers Individuales ----------
-
-def scrape_nestoria(zona, dormitorios="0", banos="0", price_min=None, price_max=None, max_results=200, strict_zone=True):
-    try:
-        zona_slug = build_zona_slug_nestoria(zona)
-        base_url = f"https://www.nestoria.pe/{zona_slug}/inmuebles/alquiler"
-        if dormitorios and dormitorios != "0":
-            base_url += f"/dormitorios-{dormitorios}"
-        params = []
-        if banos and banos != "0":
-            params.append(f"bathrooms={banos}")
-        if price_min and str(price_min) != "0":
-            params.append(f"price_min={price_min}")
-        if price_max and str(price_max) != "0":
-            params.append(f"price_max={price_max}")
-        if params:
-            base_url += "?" + "&".join(params)
-        logger.info(f"🔎 Consultando Nestoria: {base_url}")
-        headers = {"User-Agent": COMMON_UA}
-        r = requests.get(base_url, headers=headers, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        items = soup.select("ul#main_listing_res > li")
-        if not items:
-            items = soup.select("li.rating__new")
-        if not items:
-            items = [li for li in soup.find_all("li") if li.select_one(".result__details__price")]
-        listings = []
-        skipped_usd = 0
-        for i, li in enumerate(items):
-            if i >= max_results:
-                break
-            a_tag = li.select_one("a.results__link") or li.select_one("a.results__link")
-            title = link = None
-            if a_tag:
-                link = a_tag.get("data-href") or a_tag.get("href")
-                if link and link.startswith("/"):
-                    link = "https://www.nestoria.pe" + link
-                title = a_tag.get_text(strip=True)
-            if not title:
-                title = (li.select_one(".listing__title__text") or li.select_one(".listing__title") or li.get_text(" ", strip=True))[:120]
-            price_el = li.select_one(".result__details__price span") or li.select_one(".result__details__price") or li.select_one(".price")
-            price_text = price_el.get_text(strip=True) if price_el else ""
-            moneda, precio_val = parse_precio_con_moneda(price_text)
-            if price_max is not None and moneda=="S" and precio_val is not None and precio_val>price_max:
-                continue
-            if price_min is not None and moneda=="S" and precio_val is not None and precio_val<price_min:
-                continue
-            if moneda=="USD" and (price_max is not None or price_min is not None):
-                skipped_usd += 1
-                continue
-            text = li.get_text(" ", strip=True)
-            area_match = re.search(r"(\d{1,4}\s*m²|\d{1,4}\s*m2)", text)
-            area = area_match.group(0) if area_match else ""
-            bd = re.search(r"(\d+)\s*dormitori", text, flags=re.I)
-            bedrooms = bd.group(1) if bd else ""
-            bt = re.search(r"(\d+)\s*bañ", text, flags=re.I)
-            bathrooms = bt.group(1) if bt else ""
-            desc = (li.select_one(".listing__description") or li.select_one(".result__summary") or None)
-            desc_text = desc.get_text(strip=True) if desc else ""
-
-            # >>> NUEVO: Extraer URL de la imagen <<<
-            imagen_url = ""
-            img_tag = li.select_one("img")
-            if img_tag:
-                imagen_url = img_tag.get("src") or img_tag.get("data-original") or img_tag.get("data-src") or ""
-                if imagen_url.startswith("//"):
-                    imagen_url = "https:" + imagen_url
-
-            if strict_zone:
-                if zona.lower() not in title.lower() and zona.lower() not in desc_text.lower():
-                    continue
-            listings.append({
-                "titulo": title,
-                "precio": price_text,
-                "m2": area,
-                "dormitorios": bedrooms,
-                "baños": bathrooms,
-                "descripcion": desc_text,
-                "link": link or "",
-                "fuente": "nestoria",
-                "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-            })
-        df = pd.DataFrame(listings)
-        return df, skipped_usd
-    except Exception as e:
-        logger.error(f"Error en scrape_nestoria: {e}")
-        return pd.DataFrame(), 0
 
 def slugify_zone(zona: str) -> str:
     if not zona:
         return ""
-    z = zona.strip().lower()
-    replacements = {
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n", "ü": "u"
-    }
-    for a, b in replacements.items():
-        z = z.replace(a, b)
-    z = re.sub(r"\s+", "-", z)
-    z = re.sub(r"[^a-z0-9\-]", "", z)
-    return z
+    s = zona.lower().strip()
+    # Reemplazar caracteres especiales y tildes
+    trans = str.maketrans("áéíóúñü", "aeiounu")
+    s = s.translate(trans)
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    return s
 
-def scrape_infocasas(zona, dormitorios="0", banos="0", price_min=None, price_max=None, strict_zone=True, max_scrolls=8):
-    try:
-        LIMA_DISTRICTS = [
-            "barranco", "breña", "carabayllo", "chaclacayo", "chorrillos", "cieneguilla", "comas",
-            "el agustino", "independencia", "jesus maria", "la molina", "la victoria", "lince",
-            "los olivos", "lurigancho", "lurin", "magdalena del mar", "miraflores", "pachacamac",
-            "pucusana", "puente piedra", "punta hermosa", "punta negra", "rimac", "san bartolo",
-            "san borja", "san isidro", "san juan de lurigancho", "san juan de miraflores", "san luis",
-            "san martin de porres", "san miguel", "santa anita", "santa maria del mar", "santa rosa",
-            "santiago de surco", "surco", "villa el salvador", "villa maria del triunfo"
-        ]
-        CALLAO_DISTRICTS = [
-            "callao", "bellavista", "la perla", "la punta", "ventanilla", "pedro miguel"
-        ]
-        zona_slug = slugify_zone(zona)
-        zona_norm = normalize_text(zona.strip())
-        driver = create_driver(headless=True)
-        is_lima_district = zona_norm in LIMA_DISTRICTS
-        is_callao_district = zona_norm in CALLAO_DISTRICTS
-        candidate_urls = []
-        if is_lima_district:
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zona_slug}")
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zona_slug}/lima")
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zona_slug}")
-        elif is_callao_district:
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/callao/{zona_slug}")
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/callao/{zona_slug}/callao")
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/callao/{zona_slug}")
-        else:
-            candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/{zona_slug}")
-        candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zona_slug}")
-        candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zona_slug}/lima")
-        candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/{zona_slug}/callao")
-        candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zona_slug}")
-        candidate_urls.append(f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/callao/{zona_slug}")
-        candidate_urls = list(dict.fromkeys(candidate_urls))
-        soup = None
-        anchors = []
-        used_url = None
-        for url in candidate_urls:
-            try:
-                logger.info(f"🔎 Intentando Infocasas: {url}")
-                driver.get(url)
-                for _ in range(max_scrolls):
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(0.8)
-                try:
-                    WebDriverWait(driver, 8).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.lc-data")))
-                    anchors = driver.find_elements(By.CSS_SELECTOR, "a.lc-data")
-                except:
-                    page = driver.page_source
-                    soup = BeautifulSoup(page, "html.parser")
-                    possible = []
-                    for sel in ["a.lc-data", "li.lc-item", "div.listingCard", "div.listingBoxCard", "article", "div.card"]:
-                        found = soup.select(sel)
-                        if found and len(found) > 0:
-                            possible = found
-                            break
-                    if possible:
-                        anchors = []
-                        for el in possible:
-                            a = el.select_one("a[href]") or el.select_one("a.lc-data")
-                            href = a.get("href") if a else ""
-                            anchors.append({"href": href, "html": str(el), "title": (a.get("title") if a and a.get("title") else (el.get_text(" ", strip=True)[:80]))})
-                    else:
-                        anchors = []
-                if anchors and (hasattr(anchors[0], "get_attribute") or isinstance(anchors[0], dict)):
-                    results_in_zone = []
-                    for item in anchors:
-                        try:
-                            location = ""
-                            if isinstance(item, dict):
-                                html = item.get("html", "")
-                                soup = BeautifulSoup(html, "html.parser")
-                                loc_el = soup.select_one(".lc-location")
-                                if loc_el:
-                                    location = loc_el.get_text(strip=True)
-                            else:
-                                try:
-                                    loc_el = item.find_element(By.CSS_SELECTOR, ".lc-location")
-                                    location = loc_el.text
-                                except:
-                                    pass
-                            loc_norm = normalize_text(location)
-                            if strict_zone and zona_norm not in loc_norm:
-                                continue
-                            results_in_zone.append(item)
-                        except Exception as e:
-                            continue
-                    if results_in_zone:
-                        anchors = results_in_zone
-                        used_url = url
-                        break
-            except Exception as e:
-                continue
-        if not anchors:
-            try:
-                page = driver.page_source
-                soup = BeautifulSoup(page, "html.parser")
-                possible = soup.select("a.lc-data") or soup.select("li.lc-item") or soup.select("div.listingCard") or soup.select("div.listingBoxCard") or soup.select("article")
-                anchors = []
-                for el in possible:
-                    a = el.select_one("a[href]") or el.select_one("a.lc-data")
-                    href = a.get("href") if a else ""
-                    anchors.append({"href": href, "html": str(el), "title": (a.get("title") if a and a.get("title") else (el.get_text(" ", strip=True)[:80]))})
-                used_url = "fallback_page_source"
-            except Exception:
-                anchors = []
-        results = []
-        if anchors and hasattr(anchors[0], "get_attribute"):
-            for a in anchors:
-                try:
-                    href = a.get_attribute("href") or a.get_attribute("data-href") or ""
-                    title = a.get_attribute("title") or ""
-                    try:
-                        if not title and len(a.find_elements(By.CSS_SELECTOR, "h2.lc-title")):
-                            title = a.find_element(By.CSS_SELECTOR, "h2.lc-title").text
-                    except:
-                        pass
-                    location = ""
-                    try:
-                        loc_el = a.find_element(By.CSS_SELECTOR, ".lc-location")
-                        location = loc_el.text
-                    except:
-                        pass
-                    price = ""
-                    try:
-                        price = a.find_element(By.CSS_SELECTOR, "p.main-price").text
-                    except:
-                        try:
-                            price = a.find_element(By.CSS_SELECTOR, ".main-price").text
-                        except:
-                            price = ""
-                    dorms = baths = m2 = ""
-                    try:
-                        tags = a.find_elements(By.CSS_SELECTOR, ".lc-typologyTag__item strong")
-                        for t in tags:
-                            txt = t.text.lower()
-                            if "dorm" in txt:
-                                m = re.search(r"(\d+)", txt); dorms = m.group(1) if m else t.text
-                            elif "bañ" in txt:
-                                m = re.search(r"(\d+)", txt); baths = m.group(1) if m else t.text
-                            elif "m" in txt:
-                                m2 = t.text
-                    except:
-                        pass
-                    desc = ""
-                    try:
-                        desc = a.find_element(By.CSS_SELECTOR, "p.lc-description").text
-                    except:
-                        desc = ""
-
-                    # >>> NUEVO: Extraer imagen <<<
-                    imagen_url = ""
-                    try:
-                        img_el = a.find_element(By.CSS_SELECTOR, "img")
-                        imagen_url = img_el.get_attribute("src") or img_el.get_attribute("data-src") or ""
-                    except:
-                        pass
-
-                    if strict_zone and zona_norm not in normalize_text(location):
-                        continue
-                    results.append({
-                        "titulo": title or "",
-                        "precio": price or "",
-                        "m2": m2 or "",
-                        "dormitorios": dorms or "",
-                        "baños": baths or "",
-                        "descripcion": desc or "",
-                        "link": href if href.startswith("http") else ("https://www.infocasas.com.pe/" + href if href.startswith("/") else href),
-                        "ubicacion": location,
-                        "fuente": "infocasas",
-                        "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-                    })
-                except Exception:
-                    continue
-        else:
-            for item in anchors:
-                try:
-                    if isinstance(item, dict):
-                        href = item.get("href","") or ""
-                        title = item.get("title","") or ""
-                        el = BeautifulSoup(item.get("html",""), "html.parser") if item.get("html") else None
-                    else:
-                        el = item
-                        a = el.select_one("a[href]") or el.select_one("a.lc-data")
-                        href = a.get("href") if a else ""
-                        title = a.get("title") if a and a.get("title") else (el.get_text(" ", strip=True)[:80])
-                    location = ""
-                    loc_el = el.select_one(".lc-location")
-                    if loc_el:
-                        location = loc_el.get_text(strip=True)
-                    price = ""
-                    if el:
-                        p = el.select_one("p.main-price") or el.select_one(".main-price") or el.select_one(".content_result_precio")
-                        if p:
-                            price = p.get_text(" ", strip=True)
-                        text = el.get_text(" ", strip=True)
-                        m2m = re.search(r"\d{1,4}\s*(m²|m2)", text)
-                        bedrooms = re.search(r"(\d+)\s*dormitori", text, flags=re.I) or re.search(r"(\d+)\s*hab", text, flags=re.I)
-                        bathrooms = re.search(r"(\d+)\s*bañ", text, flags=re.I)
-                        m2 = m2m.group(0) if m2m else ""
-                        bedrooms_v = bedrooms.group(1) if bedrooms else ""
-                        bathrooms_v = bathrooms.group(1) if bathrooms else ""
-                        desc = el.select_one("p.lc-description") or el.select_one(".content_result_specs") or None
-                        desc_txt = desc.get_text(" ", strip=True) if desc else text[:200]
-                    else:
-                        price = ""
-                        m2 = ""
-                        bedrooms_v = ""
-                        bathrooms_v = ""
-                        desc_txt = ""
-
-                    # >>> NUEVO: Extraer imagen <<<
-                    imagen_url = ""
-                    if el:
-                        img = el.select_one("img")
-                        if img:
-                            imagen_url = img.get("src") or img.get("data-src") or ""
-
-                    if strict_zone and zona_norm not in normalize_text(location):
-                        continue
-                    results.append({
-                        "titulo": title or "",
-                        "precio": price or "",
-                        "m2": m2 or "",
-                        "dormitorios": bedrooms_v or "",
-                        "baños": bathrooms_v or "",
-                        "descripcion": desc_txt or "",
-                        "link": href if href.startswith("http") else ("https://www.infocasas.com.pe/" + href if href.startswith("/") else href),
-                        "ubicacion": location,
-                        "fuente": "infocasas",
-                        "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-                    })
-                except Exception:
-                    continue
-        df = pd.DataFrame(results)
-        return df
-    except Exception as e:
-        logger.error(f"Error en scrape_infocasas: {e}")
-        return pd.DataFrame()
-    finally:
-        driver.quit()
-
-# ---------- Adapter Doomos (versión probada y funcional) ----------
-
-def scrape_doomos_general(zona, dormitorios=0, banos=0, price_min=None, price_max=None):
-    zona_norm = (zona or "").strip()
-    if not zona_norm:
-        print("❌ Debes indicar una zona")
-        return pd.DataFrame()
-    headers = {"User-Agent": COMMON_UA}
-    # Detectar loc_name y loc_id
-    search_init = f"http://www.doomos.com.pe/search/?clase=1&stipo=16&loc_name={requests.utils.quote(zona_norm)}"
-    try:
-        r = requests.get(search_init, headers=headers, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print("⚠️ Error al cargar Doomos:", e)
-        return pd.DataFrame()
-    soup = BeautifulSoup(r.text, "html.parser")
-    loc_id_el = soup.select_one("input[name='loc_id']")
-    loc_id = loc_id_el.get("value") if loc_id_el else None
-    if not loc_id:
-        m = re.search(r"loc_id\s*[:=]\s*([-]?\d+)", r.text)
-        if m:
-            loc_id = m.group(1)
-    if not loc_id:
-        return pd.DataFrame()
-    loc_name_el = soup.select_one("input[name='loc_name']")
-    loc_name_final = loc_name_el.get("value") if loc_name_el else zona_norm
-    params = {
-        "pagina": "1",
-        "sort": "primeasc",
-        "provincia": "15",
-        "clase": "1",
-        "stipo": "16",
-        "loc_name": loc_name_final,
-        "loc_id": loc_id,
-        "preciomin": str(price_min) if price_min is not None else "min",
-        "preciomax": str(price_max) if price_max is not None else "max"
-    }
-    if dormitorios:
-        params["piezas"] = str(dormitorios)
-    if banos:
-        params["banos"] = str(banos)
-    url_final = "http://www.doomos.com.pe/search/?" + "&".join(f"{k}={requests.utils.quote(str(v))}" for k,v in params.items())
-    try:
-        r2 = requests.get(url_final, headers=headers, timeout=20)
-        r2.raise_for_status()
-    except Exception as e:
-        print("⚠️ Error cargando anuncios Doomos:", e)
-        return pd.DataFrame()
-    soup2 = BeautifulSoup(r2.text, "html.parser")
-    cards = soup2.select(".content_result")
-    results = []
-    for card in cards:
-        try:
-            # Obtener el texto completo del card
-            card_text = card.get_text(" ", strip=True)
-            # Extraer información del título
-            a = card.select_one(".content_result_titulo a")
-            titulo = a.get_text(strip=True) if a else ""
-            link = a.get("href") if a else ""
-            if link and link.startswith("/"):
-                link = "http://www.doomos.com.pe" + link
-            # Si no tiene título o link, saltar este anuncio
-            if not titulo or not link:
-                continue
-            # Extraer precio - SOLO el valor monetario
-            price_el = card.select_one(".content_result_precio")
-            price_text = price_el.get_text(" ", strip=True) if price_el else ""
-            # Regex para extraer solo el precio (S/ XXXX o $ XXXX)
-            price_match = re.search(r"(S/\.?|\$)\s*\d{1,4}(?:\.\d{1,3})?", price_text)
-            if price_match:
-                price_text = price_match.group(0).strip()
-            else:
-                # Si no encontramos el formato S/ XXXX, intentamos con el regex más general
-                price_match = re.search(r"\d{1,4}(?:\.\d{1,3})?", price_text)
-                if price_match:
-                    price_text = "S/ " + price_match.group(0)
-                else:
-                    price_text = ""
-
-            # Buscar dormitorios en el texto completo del card
-            bedrooms = 0
-            bd = re.search(r"(\d+)\s*(?:hab\.?|habitaci[oó]n|dorm|habitacion)", card_text, flags=re.I)
-            if bd:
-                bedrooms = int(bd.group(1))
-            # Buscar baños en el texto completo del card
-            bathrooms = 0
-            bt = re.search(r"(\d+)\s*(?:bañ\.?|baños|bano)", card_text, flags=re.I)
-            if bt:
-                bathrooms = int(bt.group(1))
-            # Buscar m2 en el texto completo del card
-            m2 = ""
-            m2_match = re.search(r"(\d{1,4})\s*(m²|m2|m)", card_text, flags=re.I)
-            if m2_match:
-                m2 = m2_match.group(0)
-
-            # Filtrar por dormitorios y baños si se especificaron
-            if dormitorios and bedrooms != dormitorios:
-                continue
-            if banos and bathrooms != banos:
-                continue
-
-            # >>> NUEVO: Extraer imagen <<<
-            imagen_url = ""
-            img_tag = card.select_one("img")
-            if img_tag:
-                imagen_url = img_tag.get("src") or img_tag.get("data-src") or ""
-                if imagen_url.startswith("//"):
-                    imagen_url = "https:" + imagen_url
-                elif imagen_url.startswith("/"):
-                    imagen_url = "http://www.doomos.com.pe" + imagen_url
-
-            results.append({
-                "titulo": titulo,
-                "precio": price_text or "",
-                "m2": m2 or "",
-                "dormitorios": bedrooms,
-                "baños": bathrooms,
-                "descripcion": card_text,  # Usar todo el texto como descripción
-                "link": link,
-                "fuente": "doomos",
-                "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-            })
-        except Exception as e:
-            print(f"Error procesando card: {e}")
-            continue
-    return pd.DataFrame(results)
-
-def scrape_doomos_brena(zona, dormitorios=0, banos=0):
-    headers = {"User-Agent": COMMON_UA}
-    zona_norm = normalize_text(zona.strip())
-    search_url = f"http://www.doomos.com.pe/search/?clase=1&stipo=16&loc_name={requests.utils.quote(zona)}"
-    try:
-        r = requests.get(search_url, headers=headers, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"Error fetching Doomos Breña: {e}")
-        return pd.DataFrame()
-    soup = BeautifulSoup(r.text, "html.parser")
-    cards = soup.select(".content_result")
-    results = []
-    for card in cards:
-        try:
-            a = card.select_one(".content_result_titulo a") or card.select_one(".content_result_titulo_bold a")
-            titulo = a.get_text(strip=True) if a else ""
-            link = a.get("href") if a else ""
-            if link and link.startswith("/"):
-                link = "http://www.doomos.com.pe" + link
-            # Si no tiene título o link, saltar este anuncio
-            if not titulo or not link:
-                continue
-            price_el = card.select_one(".content_result_precio")
-            price_text_full = price_el.get_text(" ", strip=True) if price_el else ""
-            # EXTRAER SOLO EL PRECIO USANDO EXPRESIÓN REGULAR
-            price_match = re.search(r"(S/\.?|\$)\s*\d{1,4}(?:\.\d{1,3})?", price_text_full)
-            if price_match:
-                price_text = price_match.group(0)
-            else:
-                price_text = ""
-            deta_el = card.select_one(".content_result_precio .content_result_deta")
-            deta_text = deta_el.get_text(" ", strip=True) if deta_el else ""
-            desc_el = card.select_one(".content_result_text .content_result_specs")
-            descripcion = desc_el.get_text(" ", strip=True) if desc_el else ""
-            resu_el = card.select_one(".content_result_specs_resu")
-            resumen = resu_el.get_text(" ", strip=True) if resu_el else ""
-            combined_text = " ".join([titulo, descripcion, resumen])
-            combined_norm = normalize_text(combined_text)
-            if zona_norm not in combined_norm:
-                continue
-            # Extraer dormitorios
-            bd_match = re.search(r"(\d+)\s*hab", deta_text, flags=re.I) or re.search(r"(\d+)\s*dorm", deta_text, flags=re.I)
-            bedrooms = int(bd_match.group(1)) if bd_match else 0
-            # Extraer baños
-            bt_match = re.search(r"(\d+)\s*bañ", deta_text, flags=re.I)
-            bathrooms = int(bt_match.group(1)) if bt_match else 0
-            # Extraer metros cuadrados
-            m2_match = re.search(r"(\d{1,4})\s*(m²|m2|m)", deta_text, flags=re.I)
-            m2 = m2_match.group(0) if m2_match else ""
-
-            # Filtrar por dormitorios y baños si se especificaron
-            if dormitorios and bedrooms != dormitorios:
-                continue
-            if banos and bathrooms != banos:
-                continue
-
-            # >>> NUEVO: Extraer imagen <<<
-            imagen_url = ""
-            img_tag = card.select_one("img")
-            if img_tag:
-                imagen_url = img_tag.get("src") or img_tag.get("data-src") or ""
-                if imagen_url.startswith("//"):
-                    imagen_url = "https:" + imagen_url
-                elif imagen_url.startswith("/"):
-                    imagen_url = "http://www.doomos.com.pe" + imagen_url
-
-            results.append({
-                "titulo": titulo,
-                "precio": price_text,
-                "m2": m2,
-                "dormitorios": bedrooms,
-                "baños": bathrooms,
-                "descripcion": descripcion,
-                "link": link,
-                "fuente": "doomos",
-                "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-            })
-        except Exception as e:
-            print(f"Error procesando card en scrape_doomos_brena: {e}")
-            continue
-    return pd.DataFrame(results)
-
-# ---------- scrape_properati (nueva fuente) ----------
-
-def scrape_properati(zona, dormitorios="0", banos="0", price_min=None, price_max=None):
-    """
-    Scraping de Properati.com.pe con transformación inteligente de nombre de zona.
-    Soporta: "Cercado de Lima" → "lima-cercado", "San Juan de Lurigancho" → "san-juan-de-lurigancho"
-    No permite resultados parciales (ej: solo "Lima" si se pide "Cercado de Lima").
-    """
-    if not zona or not zona.strip():
-        return pd.DataFrame()
-
-    # Normalizar entrada para evitar espacios extra
-    zona_input = zona.strip()
-
-    def transform_zona_for_url(zona_original):
-        """
-        Transforma el nombre de la zona para generar la URL correcta de Properati.
-        Reglas:
-        - Si contiene " de " y termina en "Lima": invertir orden y eliminar "de" → "lima-cercado"
-        - Si contiene " de " pero NO termina en Lima: mantener " de " → "san-juan-de-lurigancho"
-        - Si no tiene "de": usar tal cual
-        - Si es una sola palabra: usar tal cual
-        """
-        zona = zona_original.strip()
-        if not zona:
-            return ""
-        # Caso 1: Una sola palabra → devolver tal cual
-        if len(zona.split()) == 1:
-            return zona.lower().replace(" ", "-").replace("ñ", "n").replace("í", "i").replace("á", "a").replace("é", "e").replace("ó", "o").replace("ú", "u")
-        # Caso 2: Contiene " de " y termina en "Lima" (o variaciones)
-        if " de " in zona and zona.lower().endswith(" lima"):
-            before_de = zona.rsplit(" de ", 1)[0].strip()  # Ej: "Cercado"
-            transformed = f"lima-{before_de.lower().replace(' ', '-')}"
-            return transformed.replace("ñ", "n").replace("í", "i").replace("á", "a").replace("é", "e").replace("ó", "o").replace("ú", "u")
-        # Caso 3: Contiene " de " pero NO termina en Lima → mantener " de "
-        if " de " in zona:
-            parts = zona.split(" de ")
-            transformed = "-".join(part.lower().replace(" ", "-") for part in parts)
-            return transformed.replace("ñ", "n").replace("í", "i").replace("á", "a").replace("é", "e").replace("ó", "o").replace("ú", "u")
-        # Caso 4: Sin "de", pero múltiples palabras → sustituir espacios por guiones
-        return zona.lower().replace(" ", "-").replace("ñ", "n").replace("í", "i").replace("á", "a").replace("é", "e").replace("ó", "o").replace("ú", "u")
-
-    # Generar slug final
-    zona_url = transform_zona_for_url(zona_input)
-    base_url = f"https://www.properati.com.pe/s/{zona_url}/alquiler?propertyType=apartment%2Chouse"
-    if banos != "0" and banos:
-        base_url += f"&bathrooms={banos}"
-    if dormitorios != "0" and dormitorios:
-        base_url += f"&bedrooms={dormitorios}"
-    print(f"🌐 Properati URL generada: {base_url}")
-
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument(f"user-agent={COMMON_UA}")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-
-    try:
-        driver.get(base_url)
-        # Esperar hasta que cargue contenedor principal o mensaje de "no resultados"
-        WebDriverWait(driver, 15).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, "div[data-test='listings-serp']") or
-                      d.find_element(By.CSS_SELECTOR, ".no-results-message, .empty-state")
-        )
-        time.sleep(1.5)
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-
-        # Verificar si hay mensaje de "no resultados"
-        no_results = soup.select_one(".no-results-message, .empty-state")
-        if no_results:
-            print("🔍 No se encontraron propiedades en Properati para esta búsqueda.")
-            return pd.DataFrame()
-
-        # Buscar contenedor principal de resultados
-        listings_container = soup.find("div", {"data-test": "listings-serp"})
-        if not listings_container:
-            print("⚠️ Contenedor de resultados no encontrado en Properati.")
-            return pd.DataFrame()
-
-        cards = listings_container.select("article.snippet")
-        if not cards:
-            print("ℹ️ No se encontraron tarjetas de propiedades en Properati.")
-            return pd.DataFrame()
-
-        results = []
-        for card in cards:
-            try:
-                # Enlace completo
-                link = card.get("data-url", "")
-                if not link:
-                    a_tag = card.select_one("a.title")
-                    link = a_tag.get("href") if a_tag else ""
-                if link and link.startswith("/"):
-                    link = "https://www.properati.com.pe" + link
-
-                # Título
-                titulo = ""
-                a = card.select_one("a.title")
-                if a:
-                    titulo = a.get("title", "").strip()
-                    if not titulo:
-                        titulo = a.get_text(strip=True)
-
-                # Precio
-                price_el = card.select_one(".price")
-                precio = price_el.get_text(strip=True) if price_el else ""
-
-                # Área (m²)
-                area_el = card.select_one(".properties__area")
-                m2 = area_el.get_text(strip=True) if area_el else ""
-
-                # Dormitorios
-                bd_el = card.select_one(".properties__bedrooms")
-                dormitorios_txt = bd_el.get_text(strip=True) if bd_el else ""
-                dormitorios_val = int(re.search(r"\d+", dormitorios_txt).group()) if re.search(r"\d+", dormitorios_txt) else 0
-
-                # Baños
-                bt_el = card.select_one(".properties__bathrooms")
-                banos_txt = bt_el.get_text(strip=True) if bt_el else ""
-                banos_val = int(re.search(r"\d+", banos_txt).group()) if re.search(r"\d+", banos_txt) else 0
-
-                # Ubicación (descripción)
-                loc_el = card.select_one(".location")
-                ubicacion = loc_el.get_text(strip=True) if loc_el else ""
-
-                # >>> NUEVO: Extraer imagen <<<
-                imagen_url = ""
-                img_tag = card.select_one("img")
-                if img_tag:
-                    imagen_url = img_tag.get("src") or img_tag.get("data-src") or ""
-                    if imagen_url.startswith("//"):
-                        imagen_url = "https:" + imagen_url
-
-                results.append({
-                    "titulo": titulo,
-                    "precio": precio,
-                    "m2": m2,
-                    "dormitorios": dormitorios_val,
-                    "baños": banos_val,
-                    "descripcion": ubicacion,
-                    "link": link,
-                    "fuente": "properati",
-                    "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-                })
-            except Exception as e:
-                print("⚠️ Error procesando tarjeta en Properati:", e)
-                continue
-
-        df = pd.DataFrame(results)
-        return df
-
-    except Exception as e:
-        # Silenciamos completamente el stack trace — solo mensaje amigable
-        print("🔍 No se encontraron propiedades en Properati para esta búsqueda.")
-        return pd.DataFrame()
-    finally:
-        driver.quit()
-
-# ---------- scrape_urbania (nueva fuente) ----------
-
-def scrape_urbania(zona: str, dormitorios: str = "0", banos: str = "0", price_min: Optional[int] = None, price_max: Optional[int] = None):
-    if not zona or not zona.strip():
-        return pd.DataFrame()
-    zona_input = zona.strip()
-    zona_norm_slug = normalize_text(zona_input)
-    driver = create_driver(headless=True)
-    try:
-        base_url = f"https://urbania.pe/buscar/alquiler-de-departamentos-en-{zona_norm_slug}--lima--lima"
-        params = []
-        if dormitorios and dormitorios != "0":
-            params.append(f"bedroomsNumber={dormitorios}")
-        if banos and banos != "0":
-            params.append(f"bathroomMin={banos}")
-        if price_min is not None:
-            params.append(f"priceMin={price_min}")
-        if price_max is not None:
-            params.append(f"priceMax={price_max}")
-        params.append("currencyId=6")
-        if params:
-            separator = "&" if "?" in base_url else "?"
-            target_url = base_url + separator + "&".join(params)
-        else:
-            target_url = base_url
-        print(f"🌐 Intentando URL directa: {target_url}")
-        driver.get(target_url)
-        time.sleep(3)
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        cards = soup.select("div[data-qa='posting PROPERTY']")
-        if not cards:
-            print("⚠️ No se encontraron resultados con la URL directa. Intentando búsqueda interactiva...")
-            driver.get("https://urbania.pe/buscar/alquiler")
-            time.sleep(2)
-            try:
-                close_button = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-qa='MENU_MOBILE_CLOSE']"))
-                )
-                close_button.click()
-            except:
-                pass
-            search_input = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[data-qa='input_ubicacion']"))
-            )
-            search_input.clear()
-            search_input.send_keys(zona_input)
-            try:
-                first_suggestion = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "ul[data-qa='menuList'] li:first-child"))
-                )
-                print("✅ Sugerencia encontrada. Haciendo clic...")
-                first_suggestion.click()
-                time.sleep(3)
-            except:
-                print("⚠️ No se encontraron sugerencias. Forzando búsqueda con ENTER...")
-                search_input.send_keys(webdriver.common.keys.Keys.ENTER)
-                time.sleep(3)
-            current_url = driver.current_url
-            if any(p not in current_url for p in params):
-                if params:
-                    separator = "&" if "?" in current_url else "?"
-                    target_url = current_url + separator + "&".join(params)
-                print(f"🔗 URL con filtros interactivos: {target_url}")
-                driver.get(target_url)
-                time.sleep(3)
-        scroll_count = 0
-        while scroll_count < 5:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            scroll_count += 1
-            print(f"🔄 Realizando scroll... {scroll_count}/5")
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        cards = soup.select("div[data-qa='posting PROPERTY']")
-        if not cards:
-            print("🔍 No se encontraron propiedades en Urbania.")
-            return pd.DataFrame()
-        results = []
-        print(f"✅ Se encontraron {len(cards)} propiedades. Extrayendo datos y filtrando por zona...")
-        for card in cards:
-            try:
-                link_tag = card.select_one("h3.postingCard-module__posting-description a")
-                link = "https://urbania.pe" + link_tag["href"] if link_tag and link_tag["href"].startswith("/") else (link_tag["href"] if link_tag else "")
-                titulo = link_tag.get_text(strip=True) if link_tag else ""
-                location_el = card.select_one("div.postingCard-module__location")
-                location_text = location_el.get_text(strip=True) if location_el else ""
-                if zona_norm_slug not in normalize_text(titulo) and zona_norm_slug not in normalize_text(location_text):
-                    continue
-                price_el = card.select_one("div.postingPrices-module__price")
-                precio = price_el.get_text(strip=True) if price_el else ""
-                features = card.select("span.postingMainFeatures-module__posting-main-features-listing")
-                m2, dormitorios_val, banos_val = "", 0, 0
-                for feat in features:
-                    text = feat.get_text(strip=True)
-                    if re.search(r"\d+\s*m²|\d+\s*m2", text, re.I):
-                        m2 = text
-                    elif re.search(r"(\d+)\s*dorm", text, re.I):
-                        dormitorios_val = int(re.search(r"(\d+)", text).group(1))
-                    elif re.search(r"(\d+)\s*bañ", text, re.I):
-                        banos_val = int(re.search(r"(\d+)", text).group(1))
-                descripcion = titulo
-                if dormitorios_val == 0 or banos_val == 0 or not titulo or not link:
-                    continue
-
-                # >>> NUEVO: Extraer URL de la primera imagen <<<
-                imagen_url = ""
-                img_tag = card.select_one("img")
-                if img_tag:
-                    imagen_url = img_tag.get("src") or img_tag.get("data-src") or ""
-                    if imagen_url.startswith("//"):
-                        imagen_url = "https:" + imagen_url
-
-                results.append({
-                    "titulo": titulo,
-                    "precio": precio,
-                    "m2": m2,
-                    "dormitorios": dormitorios_val,
-                    "baños": banos_val,
-                    "descripcion": descripcion,
-                    "link": link,
-                    "fuente": "urbania",
-                    "imagen_url": imagen_url  # 👈 NUEVA COLUMNA
-                })
-            except Exception as e:
-                print(f"⚠️ Error procesando una tarjeta: {e}")
-                continue
-        df = pd.DataFrame(results)
-        print(f"✅ ¡Éxito! Se encontraron {len(df)} propiedades en Urbania.")
-        return df
-    except Exception as e:
-        print(f"❌ Error general en el scraper de Urbania: {e}")
-        return pd.DataFrame()
-    finally:
-        driver.quit()
-
-# ---------- Adaptadores ----------
-def _adapter_nestoria(zona, dormitorios, banos, price_min, price_max):
-    df, skipped = scrape_nestoria(zona, dormitorios=dormitorios, banos=banos, price_min=price_min, price_max=price_max, max_results=50, strict_zone=True)
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-
-def _adapter_infocasas(zona, dormitorios, banos, price_min, price_max):
-    df = scrape_infocasas(zona, dormitorios=dormitorios, banos=banos, price_min=price_min, price_max=price_max, strict_zone=True)
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-
-def _adapter_doomos(zona, dormitorios="0", banos="0", price_min=None, price_max=None):
-    # Convertir dormitorios y banos a enteros
-    try:
-        dorm = int(dormitorios) if dormitorios and dormitorios != "0" else 0
-    except:
-        dorm = 0
-    try:
-        ban = int(banos) if banos and banos != "0" else 0
-    except:
-        ban = 0
-    # Primero intentar con el código general
-    df = scrape_doomos_general(zona, dorm, ban, price_min, price_max)
-    if df.empty:
-        print("⚠️ No se encontraron anuncios con el código general, probando código especial...")
-        df = scrape_doomos_brena(zona, dorm, ban)
-    return df
-
-def _adapter_properati(zona, dormitorios, banos, price_min, price_max):
-    """Adaptador para usar scrape_properati dentro del sistema combinado."""
-    df = scrape_properati(zona, dormitorios=dormitorios, banos=banos)
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-
-def _adapter_urbania(zona, dormitorios, banos, price_min, price_max):
-    df = scrape_urbania(zona, dormitorios=dormitorios, banos=banos, price_min=price_min, price_max=price_max)
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-
-# Lista de scrapers
-SCRAPERS = [
-    ("nestoria", _adapter_nestoria),
-    ("infocasas", _adapter_infocasas),
-    ("urbania", _adapter_urbania),
-    ("properati", _adapter_properati),
-    ("doomos", _adapter_doomos),
-]
-
-# ---------- Filtrado y Combinación ----------
-
-def _extract_int_from_text(s):
-    if s is None:
-        return None
-    s = str(s)
-    m = re.search(r"(\d+)", s)
-    return int(m.group(1)) if m else None
+def parse_precio_con_moneda(precio_str):
+    if not precio_str:
+        return (None, None)
+    s = str(precio_str)
+    moneda = None
+    if "S/" in s or s.strip().startswith("S/"):
+        moneda = "S"
+    elif "$" in s:
+        moneda = "USD"
+    nums = re.sub(r"[^\d]", "", s)
+    return (moneda, int(nums)) if nums else (moneda, None)
 
 def _extract_m2(s):
     if s is None:
         return None
-    s = str(s)
-    m = re.search(r"(\d{1,4})\s*(m²|m2)", s, flags=re.I)
+    m = re.search(r"(\d{1,4})\s*(m²|m2)", str(s), flags=re.I)
     return int(m.group(1)) if m else None
 
 def _parse_price_soles(s):
     moneda, val = parse_precio_con_moneda(str(s))
-    if moneda == "S" and val is not None:
-        return val
-    return None
+    return val if moneda == "S" else None
+
+# -------------------- Nestoria (VERSÓN CORREGIDA Y FUNCIONAL CON IMÁGENES) --------------------
+EXCEPCIONES = ["miraflores", "tarapoto", "la molina", "magdalena", "lambayeque", "ventanilla", "la victoria"]
+
+def normalize_text(text):
+    """Elimina acentos y pasa a minúsculas"""
+    import unicodedata
+    return unicodedata.normalize('NFKD', text.lower()).encode('ASCII','ignore').decode('utf-8')
+
+def build_zona_slug_nestoria(zona_input: str) -> str:
+    if not zona_input or not zona_input.strip():
+        return "lima"  # ← ¡ESTO ES LO ÚNICO QUE CAMBIA!
+    z = zona_input.strip().lower().replace(" ", "-")
+    if z not in [e.lower() for e in EXCEPCIONES]:
+        return z
+    else:
+        return "lima_" + z
+
+def _extract_int_from_text(s):
+    """
+    Extrae el primer número entero de una cadena de texto.
+    Es más robusta y maneja espacios, saltos de línea y caracteres especiales.
+    """
+    if s is None:
+        return None
+    # Convertir a string y limpiar espacios en blanco alrededor
+    text = str(s).strip()
+    # Reemplazar cualquier espacio en blanco (incluyendo &nbsp;, tabulaciones, saltos de línea) por un espacio normal
+    text = re.sub(r'\s+', ' ', text)
+    # Buscar el primer número entero
+    m = re.search(r'(\d+)', text)
+    return int(m.group(1)) if m else None
+
+def scrape_nestoria(zona: str = "", dormitorios: str = "0", banos: str = "0",
+                    price_min: Optional[int] = None, price_max: Optional[int] = None,
+                    palabras_clave: str = "", max_results_per_zone: int = 200):
+    """
+    Scraper FINAL para Nestoria. Usa Selenium.
+    Extrae la imagen DEL DETALLE de cada anuncio.
+    Solo entra al detalle para obtener la imagen, no para extraer más datos.
+    """
+    zona_slug = build_zona_slug_nestoria(zona)
+    base_url = f"https://www.nestoria.pe/{zona_slug}/inmuebles/alquiler"
+    if dormitorios and dormitorios != "0":
+        base_url += f"/dormitorios-{dormitorios}"
+    params = []
+    if banos and banos != "0":
+        params.append(f"bathrooms={banos}")
+    if price_min and str(price_min) != "0":
+        params.append(f"price_min={price_min}")
+    if price_max and str(price_max) != "0":
+        params.append(f"price_max={price_max}")
+    if params:
+        base_url += "?" + "&".join(params)
+
+    print(f"URL de Nestoria: {base_url}")
+    driver = create_driver(headless=True)
+    results = []
+    try:
+        driver.get(base_url)
+        time.sleep(3)
+        # Scroll para cargar más resultados
+        for _ in range(5):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        # Seleccionar los contenedores de anuncios
+        items = soup.select("li.rating__new") or soup.select("ul#main__listing_res > li")
+        if not items:
+            items = [li for li in soup.find_all("li") if li.select_one(".result__details__price")]
+        if not items:
+            items = soup.find_all(["li", "div", "article"], class_=lambda x: x and any(cls in x for cls in ["listing", "result", "property", "item"]))
+        seen_links = set()
+        for i, li in enumerate(items):
+            try:
+                # Extraer link
+                a_tag = li.select_one("a.results__link") or li.select_one("a[href]")
+                if not a_tag:
+                    continue
+                link = a_tag.get("data-href") or a_tag.get("href") or ""
+                if link and link.startswith("/"):
+                    link = "https://www.nestoria.pe" + link
+                if not link or link in seen_links:
+                    continue
+                # Extraer título
+                title_elem = li.select_one(".listing__title__text") or li.select_one(".listing__title") or a_tag
+                title = title_elem.get_text(" ", strip=True) if title_elem else a_tag.get_text(" ", strip=True)[:140]
+                # Extraer precio
+                price_elem = li.select_one(".result__details__price span") or li.select_one(".result__details__price") or li.select_one(".price")
+                price_text = price_elem.get_text(" ", strip=True) if price_elem else ""
+                # Aplicar filtro de precio aquí mismo
+                moneda, precio_val = parse_precio_con_moneda(price_text)
+                if price_max is not None and moneda == "S" and precio_val is not None and precio_val > price_max:
+                    continue
+                if price_min is not None and moneda == "S" and precio_val is not None and precio_val < price_min:
+                    continue
+                if moneda == "USD" and (price_max is not None or price_min is not None):
+                    continue
+                # Extraer descripción
+                desc_elem = li.select_one(".listing__description") or li.select_one(".result__summary") or None
+                desc = desc_elem.get_text(" ", strip=True) if desc_elem else li.get_text(" ", strip=True)[:800]
+                # Extraer dormitorios, baños y m2 del texto
+                text_content = li.get_text(" ", strip=True).lower()
+                dormitorios_text = ""
+                dorm_match = re.search(r'(\d+)\s*dormitori', text_content, flags=re.I)
+                if dorm_match:
+                    dormitorios_text = dorm_match.group(1)
+                banos_text = ""
+                banos_match = re.search(r'(\d+)\s*bañ', text_content, flags=re.I)
+                if banos_match:
+                    banos_text = banos_match.group(1)
+                m2_text = ""
+                m2_match = re.search(r'(\d{1,4})\s*(m²|m2)', text_content, flags=re.I)
+                if m2_match:
+                    m2_text = m2_match.group(1)
+                # AHORA: Entrar al detalle para obtener la imagen principal
+                img_url = ""
+                try:
+                    driver.get(link)
+                    time.sleep(1)  # Esperar a que cargue la imagen
+                    detail_soup = BeautifulSoup(driver.page_source, "html.parser")
+                    # Buscar la imagen principal en el detalle
+                    main_img = detail_soup.select_one("img[data-element='main-swiper-slide']")
+                    if main_img:
+                        img_url = main_img.get("src") or main_img.get("data-src") or ""
+                        if img_url and img_url.startswith("//"):
+                            img_url = "https:" + img_url
+                        img_url = img_url.strip()
+                    else:
+                        # Fallback: buscar cualquier img dentro de .photos .swiper-slide
+                        fallback_img = detail_soup.select_one(".photos .swiper-slide img")
+                        if fallback_img:
+                            img_url = fallback_img.get("src") or fallback_img.get("data-src") or ""
+                            if img_url and img_url.startswith("//"):
+                                img_url = "https:" + img_url
+                            img_url = img_url.strip()
+                except Exception as e:
+                    print(f"Error al obtener imagen de detalle en Nestoria para {link}: {e}")
+                    pass
+                results.append({
+                    "titulo": title,
+                    "precio": price_text,
+                    "m2": m2_text,
+                    "dormitorios": dormitorios_text,
+                    "baños": banos_text,
+                    "descripcion": desc,
+                    "link": link,
+                    "imagen_url": img_url
+                })
+                seen_links.add(link)
+            except Exception as e:
+                continue
+    except Exception as e:
+        print(f"Error en Nestoria scraper: {e}")
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+    print(f"Procesados {len(results)} anuncios válidos")
+    return pd.DataFrame(results)
+
+# -------------------- Infocasas --------------------
+def scrape_infocasas(zona: str = "", dormitorios: str = "0", banos: str = "0",
+                     price_min: Optional[int] = None, price_max: Optional[int] = None,
+                     palabras_clave: str = "", max_scrolls: int = 8):
+    # Mapeo específico para InfoCasas
+    ZONA_MAPEO_INFOCASAS = {
+        "ancón": "ancon",
+        "ate": "ate",
+        "barranco": "barranco",
+        "breña": "breña",
+        "carabayllo": "carabayllo",
+        "chaclacayo": "chaclacayo",
+        "chorrillos": "chorrillos",
+        "cieneguilla": "cieneguilla",
+        "comas": "comas",
+        "el agustino": "el-agustino",
+        "independencia": "independencia",
+        "jesús maría": "jesus-maria",
+        "la molina": "la-molina",
+        "la victoria": "la-victoria",
+        "lima": "lima-cercado",
+        "lince": "lince",
+        "los olivos": "los-olivos",
+        "lurigancho": "lurigancho",
+        "lurín": "lurin",
+        "magdalena del mar": "magdalena-del-mar",
+        "miraflores": "miraflores",
+        "pachacámac": "pachacamac",
+        "pucusana": "pucusana",
+        "pueblo libre": "pueblo-libre",
+        "puente piedra": "puente-piedra",
+        "punta hermosa": "punta-hermosa",
+        "punta negra": "punta-negra",
+        "rímac": "rimac",
+        "san bartolo": "san-bartolo",
+        "san borja": "san-borja",
+        "san isidro": "san-isidro",
+        "san juan de lurigancho": "san-juan-de-lurigancho",
+        "san juan de miraflores": "san-juan-de-miraflores",
+        "san luis": "san-luis",
+        "san martín de porres": "san-martin-de-porres",
+        "san miguel": "san-miguel",
+        "santa anita": "santa-anita",
+        "santa maría del mar": "santa-maria-del-mar",
+        "santa rosa": "santa-rosa",
+        "santiago de surco": "santiago-de-surco",
+        "surquillo": "surquillo",
+        "villa el salvador": "villa-el-salvador",
+        "villa maría del triunfo": "villa-maria-del-triunfo"
+    }
+
+    # Construir URL base según la zona
+    if zona and zona.strip():
+        zona_lower = zona.strip().lower()
+        zone_slug = ZONA_MAPEO_INFOCASAS.get(zona_lower, slugify_zone(zona))
+        base = f"https://www.infocasas.com.pe/alquiler/casas-y-departamentos/lima/{zone_slug}"
+    else:
+        base = "https://www.infocasas.com.pe/alquiler/casas-y-departamentos"
+
+    # Agregar filtros si están especificados
+    if dormitorios and dormitorios != "0" and banos and banos != "0" and price_min is not None and price_max is not None:
+        base += f"/{dormitorios}-dormitorio/{banos}-bano/desde-{price_min}/hasta-{price_max}?&IDmoneda=6"
+    elif dormitorios and dormitorios != "0" and banos and banos != "0":
+        base += f"/{dormitorios}-dormitorio/{banos}-bano"
+    elif dormitorios and dormitorios != "0":
+        base += f"/{dormitorios}-dormitorio"
+    elif banos and banos != "0":
+        base += f"/{banos}-bano"
+
+    # Agregar parámetros de búsqueda si existen
+    if palabras_clave and palabras_clave.strip():
+        if "?" in base:
+            base += f"&searchstring={requests.utils.quote(palabras_clave.strip())}"
+        else:
+            base += f"?searchstring={requests.utils.quote(palabras_clave.strip())}"
+
+    print(f"URL de InfoCasas: {base}")  # Mostrar URL usada
+    driver = create_driver(headless=True)
+    results = []
+    try:
+        driver.get(base)
+        time.sleep(2)  # Esperar a que cargue la página
+        # Hacer scroll para cargar más resultados
+        for _ in range(max_scrolls):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.6)
+
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        # Buscar los contenedores de anuncios específicos de InfoCasas
+        nodes = soup.select("a.lc-data") or soup.select("div.listingCard") or soup.select("article")
+
+        listings = []
+        for n in nodes:
+            try:
+                # Verificar que el elemento tiene el atributo href y class lc-data
+                if not n.get("href") and not n.select_one("a[href]"):
+                    continue
+                a = n if n.name == "a" else n.select_one("a[href]")
+                href = a.get("href") if a else ""
+                # Construir URL completa
+                if href and href.startswith("/"):
+                    href = "https://www.infocasas.com.pe" + href
+                # Extraer título
+                title_elem = n.select_one("h2.lc-title") or n.select_one(".lc-title") or a
+                title = title_elem.get_text(" ", strip=True) if title_elem else n.get_text(" ", strip=True)[:250]
+                # Extraer precio
+                price = ""
+                price_elem = n.select_one(".main-price") or n.select_one(".lc-price p") or n.select_one(".property-price-tag p")
+                if price_elem:
+                    price = price_elem.get_text(" ", strip=True)
+                # Extraer ubicación
+                location_elem = n.select_one(".lc-location") or n.select_one("strong")
+                location = location_elem.get_text(" ", strip=True) if location_elem else ""
+                # Extraer dormitorios, baños y m² de los tags
+                dormitorios_text = ""
+                banos_text = ""
+                m2_text = ""
+                # Buscar en los elementos con clase lc-typologyTag__item
+                typology_items = n.select(".lc-typologyTag__item strong")
+                for item in typology_items:
+                    text = item.get_text().strip()
+                    if "Dorm" in text:
+                        dorm_match = re.search(r'(\d+)', text)
+                        if dorm_match:
+                            dormitorios_text = dorm_match.group(1)
+                    elif "Baños" in text or "Baño" in text:
+                        banos_match = re.search(r'(\d+)', text)
+                        if banos_match:
+                            banos_text = banos_match.group(1)
+                    elif "m²" in text:
+                        m2_match = re.search(r'(\d+)', text)
+                        if m2_match:
+                            m2_text = m2_match.group(1)
+                # Extraer descripción
+                desc_elem = n.select_one(".lc-description") or n.select_one("p")
+                desc = desc_elem.get_text(" ", strip=True) if desc_elem else n.get_text(" ", strip=True)[:400]
+                # Guardar el link para visitarlo después y extraer la imagen
+                listings.append({
+                    "titulo": title,
+                    "precio": price,
+                    "m2": m2_text,
+                    "dormitorios": dormitorios_text,
+                    "baños": banos_text,
+                    "descripcion": desc,
+                    "link": href or "",
+                    "imagen_url": ""  # Temporalmente vacío
+                })
+            except Exception as e:
+                continue
+
+        # Ahora visitamos cada link para obtener la imagen real
+        for listing in listings:
+            if not listing["link"]:
+                continue
+            try:
+                driver.get(listing["link"])
+                time.sleep(1)  # Esperar a que cargue la página
+                detail_soup = BeautifulSoup(driver.page_source, "html.parser")
+                # Buscar la imagen según la estructura proporcionada
+                img_tag = detail_soup.select_one("div.gallery-image img") or \
+                          detail_soup.select_one("img[alt='Image']") or \
+                          detail_soup.select_one(".property_details_cover img") or \
+                          detail_soup.find("img", {"class": lambda x: x and 'gallery-image' in x})
+                if img_tag:
+                    img_url = img_tag.get("src") or img_tag.get("data-src") or ""
+                    if img_url and img_url.startswith("//"):
+                        img_url = "https:" + img_url
+                    listing["imagen_url"] = img_url.strip()
+                else:
+                    # Si no se encuentra en los selectores específicos, intentar con img general
+                    img_tags = detail_soup.find_all("img")
+                    for img in img_tags:
+                        img_url = img.get("src") or img.get("data-src") or ""
+                        if img_url and ("cdn" in img_url or "repo" in img_url) and not img_url.endswith(".svg"):
+                            if img_url.startswith("//"):
+                                img_url = "https:" + img_url
+                            listing["imagen_url"] = img_url.strip()
+                            break
+            except Exception as e:
+                # Si hay error al visitar el link, dejamos la imagen vacía
+                pass
+            results.append(listing)
+    except Exception as e:
+        print(f"Error en InfoCasas scraper: {e}")
+        pass
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+    return pd.DataFrame(results)
+
+# -------------------- Urbania --------------------
+def scrape_urbania(zona: str = "", dormitorios: str = "0", banos: str = "0",
+                   price_min: Optional[int] = None, price_max: Optional[int] = None,
+                   palabras_clave: str = "", max_pages: int = 6, wait_time: float = 1.5):
+    zona = (zona or "").strip()
+
+    # construir keyword combinando filtros (si el usuario solo pone keyword, la usamos)
+    kw_parts = []
+    if palabras_clave and palabras_clave.strip():
+        kw_parts.append(palabras_clave.strip())
+    if dormitorios and str(dormitorios) != "0":
+        kw_parts.append(f"{dormitorios} dormitorios")
+    if banos and str(banos) != "0":
+        kw_parts.append(f"{banos} banos")
+    keyword_value = " ".join(kw_parts).strip()
+
+    # CAMBIO CLAVE: Siempre usar la zona si está especificada, independientemente de las keywords
+    if zona:
+        # Mapeo específico para Urbania
+        ZONA_MAPEO_URBANIA = {
+            "ancón": "ancon",
+            "ate": "ate-vitarte",  # Usar ate-vitarte como fallback
+            "barranco": "barranco",
+            "breña": "brena",
+            "carabayllo": "carabayllo",
+            "chaclacayo": "chaclacayo",
+            "chorrillos": "chorrillos",
+            "cieneguilla": "cieneguilla",
+            "comas": "comas",
+            "el agustino": "el-agustino",
+            "independencia": "independencia",
+            "jesús maría": "jesus-maria",
+            "la molina": "la-molina",
+            "la victoria": "la-victoria",
+            "lima": "lima-cercado",
+            "lince": "lince",
+            "los olivos": "los-olivos",
+            "lurigancho": "lurigancho",
+            "lurín": "lurin",
+            "magdalena del mar": "magdalena-del-mar",
+            "miraflores": "miraflores",
+            "pachacámac": "pachacamac",
+            "pucusana": "pucusana",
+            "pueblo libre": "pueblo-libre",
+            "puente piedra": "puente-piedra",
+            "punta hermosa": "punta-hermosa",
+            "punta negra": "punta-negra",
+            "rímac": "rimac",
+            "san bartolo": "san-bartolo",
+            "san borja": "san-borja",
+            "san isidro": "san-isidro",
+            "san juan de lurigancho": "san-juan-de-lurigancho",
+            "san juan de miraflores": "san-juan-de-miraflores",
+            "san luis": "san-luis",
+            "san martín de porres": "san-martin-de-porres",
+            "san miguel": "san-miguel",
+            "santa anita": "santa-anita",
+            "santa maría del mar": "santa-maria-del-mar",
+            "santa rosa": "santa-rosa",
+            "santiago de surco": "santiago-de-surco",
+            "surquillo": "surquillo",
+            "villa el salvador": "villa-el-salvador",
+            "villa maría del triunfo": "villa-maria-del-triunfo"
+        }
+        zona_lower = zona.strip().lower()
+        zone_slug = ZONA_MAPEO_URBANIA.get(zona_lower, slugify_zone(zona))
+        base = f"https://urbania.pe/buscar/alquiler-de-departamentos-en-{zone_slug}--lima--lima"
+    else:
+        base = "https://urbania.pe/buscar/alquiler-de-departamentos"
+
+    params = []
+    if keyword_value:
+        params.append(f"keyword={requests.utils.quote(keyword_value)}")
+    if price_min is not None:
+        params.append(f"priceMin={price_min}")
+    if price_max is not None:
+        params.append(f"priceMax={price_max}")
+    if dormitorios and dormitorios != "0":
+        params.append(f"bedroomMin={dormitorios}")
+    if banos and banos != "0":
+        params.append(f"bathroomMin={banos}")
+    if price_min is not None or price_max is not None:
+        params.append("currencyId=6")  # Soles
+
+    url = base + ("?" + "&".join(params) if params else "")
+    print(f"URL de Urbania: {url}")  # Mostrar URL usada
+
+    driver = create_driver(headless=True)
+    results = []
+    seen = set()
+    try:
+        driver.get(url)
+        # esperar unos segundos por elementos representativos (no bloquear si timeout)
+        try:
+            WebDriverWait(driver, 12).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "article, div[data-qa='posting PROPERTY'], div.postingCard"))
+            )
+        except:
+            pass
+
+        page_count = 0
+        while page_count < max_pages:
+            page_count += 1
+            last_h = driver.execute_script("return document.body.scrollHeight")
+            for _ in range(8):
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(wait_time)
+                new_h = driver.execute_script("return document.body.scrollHeight")
+                if new_h == last_h:
+                    break
+                last_h = new_h
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            # intentar varios selectores
+            card_selectors = [
+                "div[data-qa='posting PROPERTY']",
+                "article",
+                "div.postingCard-module__posting",
+                "div.postingCard",
+                "div.posting-card",
+                "div[class*='postingCard']",
+            ]
+            cards = []
+            for sel in card_selectors:
+                found = soup.select(sel)
+                if found and len(found) > 0:
+                    cards = found
+                    break
+            if not cards:
+                cards = soup.select("a[href]")[:0]  # vacío
+
+            prev_len = len(results)
+            for c in cards:
+                try:
+                    a_tag = c.select_one("a[href]") or c.select_one("h2 a") or c.select_one("h3 a")
+                    link = a_tag.get("href") if a_tag else ""
+                    if link and link.startswith("/"):
+                        link = "https://urbania.pe" + link
+                    if not link:
+                        continue
+                    if link in seen:
+                        continue
+                    seen.add(link)
+
+                    title = a_tag.get_text(" ", strip=True) if a_tag and a_tag.get_text(strip=True) else (c.get_text(" ", strip=True)[:140])
+                    price_el = c.select_one("div.postingPrices-module__price") or c.select_one(".first-price") or c.select_one(".price")
+                    price = price_el.get_text(" ", strip=True) if price_el else ""
+                    desc = c.get_text(" ", strip=True)[:400]
+
+                    img = ""
+                    img_tag = c.select_one("img")
+                    if img_tag:
+                        img = img_tag.get("src") or img_tag.get("data-src") or ""
+                        if img and img.startswith("//"): img = "https:" + img
+                        img = img.strip()
+
+                    # EXTRAER DORMITORIOS
+                    dormitorios_text = ""
+                    dorm_elem = c.select_one(".postingMainFeatures-module__posting-main-features-span:contains('dorm.')")
+                    if dorm_elem:
+                        dorm_text = dorm_elem.get_text(" ", strip=True)
+                        dorm_match = re.search(r'(\d+)', dorm_text)
+                        if dorm_match:
+                            dormitorios_text = dorm_match.group(1)
+
+                    # EXTRAER BAÑOS
+                    banos_text = ""
+                    banos_elem = c.select_one(".postingMainFeatures-module__posting-main-features-span:contains('baño')")
+                    if banos_elem:
+                        banos_text_full = banos_elem.get_text(" ", strip=True)
+                        banos_match = re.search(r'(\d+)', banos_text_full)
+                        if banos_match:
+                            banos_text = banos_match.group(1)
+
+                    # EXTRAER METROS CUADRADOS
+                    m2_text = ""
+                    m2_elem = c.select_one(".postingMainFeatures-module__posting-main-features-span:contains('m²')")
+                    if m2_elem:
+                        m2_text_full = m2_elem.get_text(" ", strip=True)
+                        m2_match = re.search(r'(\d+)', m2_text_full)
+                        if m2_match:
+                            m2_text = m2_match.group(1)
+
+                    # AHORA INCLUIMOS LOS VALORES EXTRAÍDOS
+                    results.append({
+                        "titulo": title,
+                        "precio": price,
+                        "m2": m2_text,
+                        "dormitorios": dormitorios_text,
+                        "baños": banos_text,
+                        "descripcion": desc,
+                        "link": link,
+                        "imagen_url": img
+                    })
+                except Exception:
+                    continue
+
+            # si no hay nuevos resultados intentar paginar/click "cargar más"
+            if len(results) == prev_len:
+                clicked = False
+                try:
+                    # probar varios selectores para "cargar más" / siguiente
+                    next_selectors = [
+                        "a[rel='next']", "a[aria-label='Siguiente']", "a[data-qa='pagination-next']",
+                        "button[data-qa='pagination-next']", "a.pagination__next", "a.next", "button.load-more", "a.load-more"
+                    ]
+                    for sel in next_selectors:
+                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                        for e in elems:
+                            try:
+                                if e.is_displayed():
+                                    driver.execute_script("arguments[0].scrollIntoView(true);", e)
+                                    time.sleep(0.2)
+                                    e.click()
+                                    time.sleep(wait_time + 0.5)
+                                    clicked = True
+                                    break
+                            except:
+                                continue
+                        if clicked:
+                            break
+                except:
+                    clicked = False
+
+                if not clicked:
+                    # intentar incrementar page= en URL
+                    cur = driver.current_url
+                    m = re.search(r"([?&]page=)(\d+)", cur)
+                    if m:
+                        cur_page = int(m.group(2))
+                        next_page = cur_page + 1
+                        new_url = re.sub(r"([?&]page=)\d+", r"\1{}".format(next_page), cur)
+                        try:
+                            driver.get(new_url)
+                            time.sleep(wait_time + 0.8)
+                            clicked = True
+                        except:
+                            clicked = False
+                if not clicked:
+                    break
+
+            time.sleep(0.4)
+
+        return pd.DataFrame(results)
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+# -------------------- Properati --------------------
+def scrape_properati(zona: str = "", dormitorios: str = "0", banos: str = "0",
+                     price_min: Optional[int] = None, price_max: Optional[int] = None,
+                     palabras_clave: str = ""):
+    if zona and zona.strip():
+        # Mapeo específico para Properati
+        ZONA_MAPEO_PROPERATI = {
+            "ancón": "ancon",
+            "ate": "ate",
+            "barranco": "barranco",
+            "breña": "brena",
+            "carabayllo": "carabayllo",
+            "chaclacayo": "chaclacayo",
+            "chorrillos": "chorrillos",
+            "cieneguilla": "cieneguilla",
+            "comas": "comas",
+            "el agustino": "el-agustino",
+            "independencia": "independencia",
+            "jesús maría": "jesus-maria",
+            "la molina": "la-molina",
+            "la victoria": "la-victoria",
+            "lima": "lima",
+            "lince": "lince",
+            "los olivos": "los-olivos",
+            "lurigancho": "lurigancho",
+            "lurín": "lurin",
+            "magdalena del mar": "magdalena-del-mar",
+            "miraflores": "miraflores",
+            "pachacámac": "pachacamac",
+            "pucusana": "pucusana",
+            "pueblo libre": "pueblo-libre",
+            "puente piedra": "puente-piedra",
+            "punta hermosa": "punta-hermosa",
+            "punta negra": "punta-negra",
+            "rímac": "rimac",
+            "san bartolo": "san-bartolo",
+            "san borja": "san-borja",
+            "san isidro": "san-isidro",
+            "san juan de lurigancho": "san-juan-de-lurigancho",
+            "san juan de miraflores": "san-juan-de-miraflores",
+            "san luis": "san-luis",
+            "san martín de porres": "san-martin-de-porres",
+            "san miguel": "san-miguel",
+            "santa anita": "santa-anita",
+            "santa maría del mar": "santa-maria-del-mar",
+            "santa rosa": "santa-rosa",
+            "santiago de surco": "santiago-de-surco",
+            "surquillo": "surquillo",
+            "villa el salvador": "villa-el-salvador",
+            "villa maría del triunfo": "villa-maria-del-triunfo"
+        }
+        zona_lower = zona.strip().lower()
+        zone_slug = ZONA_MAPEO_PROPERATI.get(zona_lower, slugify_zone(zona))
+        base = f"https://www.properati.com.pe/s/{zone_slug}/alquiler?propertyType=apartment%2Chouse"
+    else:
+        base = "https://www.properati.com.pe/s/alquiler?propertyType=apartment%2Chouse"
+
+    # Agregar parámetros de filtros
+    params = []
+    if dormitorios and dormitorios != "0":
+        params.append(f"bedrooms={dormitorios}")
+    if banos and banos != "0":
+        params.append(f"bathrooms={banos}")
+    if price_min is not None:
+        params.append(f"minPrice={price_min}")
+    if price_max is not None:
+        params.append(f"maxPrice={price_max}")
+    if params:
+        base += "&" + "&".join(params)
+    if palabras_clave and palabras_clave.strip():
+        base += f"&keyword={requests.utils.quote(palabras_clave.strip())}"
+
+    print(f"URL de Properati: {base}")  # Mostrar URL usada
+
+    try:
+        r = requests.get(base, headers={"User-Agent": COMMON_UA}, timeout=15)
+        r.raise_for_status()
+    except:
+        return pd.DataFrame()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    cards = soup.select("article") or soup.select("div.posting-card") or soup.select("a[href]")
+    results = []
+    for c in cards:
+        try:
+            a = c.select_one("a[href]") or c.select_one("a.title")
+            href = a.get("href") if a else ""
+            if href and href.startswith("/"):
+                href = "https://www.properati.com.pe" + href
+            title = a.get_text(" ", strip=True) if a else c.get_text(" ", strip=True)[:140]
+
+            price = ""
+            price_elem = c.select_one(".price")
+            if price_elem:
+                price = price_elem.get_text(" ", strip=True)
+
+            # EXTRAER DORMITORIOS
+            dormitorios_text = ""
+            dorm_elem = c.select_one(".properties__bedrooms")
+            if dorm_elem:
+                dorm_text = dorm_elem.get_text(" ", strip=True)
+                dorm_match = re.search(r'(\d+)', dorm_text)
+                if dorm_match:
+                    dormitorios_text = dorm_match.group(1)
+
+            # EXTRAER BAÑOS
+            banos_text = ""
+            banos_elem = c.select_one(".properties__bathrooms")
+            if banos_elem:
+                banos_text_full = banos_elem.get_text(" ", strip=True)
+                banos_match = re.search(r'(\d+)', banos_text_full)
+                if banos_match:
+                    banos_text = banos_match.group(1)
+
+            # EXTRAER METROS CUADRADOS
+            m2_text = ""
+            m2_elem = c.select_one(".properties__area")
+            if m2_elem:
+                m2_text_full = m2_elem.get_text(" ", strip=True)
+                m2_match = re.search(r'(\d+)', m2_text_full)
+                if m2_match:
+                    m2_text = m2_match.group(1)
+
+            img = ""
+            img_tag = c.select_one("img")
+            if img_tag:
+                img = img_tag.get("src") or img_tag.get("data-src") or ""
+                # Filtrar imágenes no deseadas: solo aceptar las que comienzan con https://img (no con https://images.proppit)
+                if img and img.startswith("https://img"):
+                    img = img.strip()
+                elif img and img.startswith("//"):
+                    img_full = "https:" + img
+                    if img_full.startswith("https://img"):
+                        img = img_full.strip()
+                    else:
+                        img = ""  # Rechazar otras fuentes
+                else:
+                    img = ""  # Rechazar si no cumple con el criterio
+
+            # AHORA INCLUIMOS LOS VALORES EXTRAÍDOS
+            results.append({
+                "titulo": title,
+                "precio": price,
+                "m2": m2_text,
+                "dormitorios": dormitorios_text,
+                "baños": banos_text,
+                "descripcion": title,
+                "link": href or "",
+                "imagen_url": img
+            })
+        except Exception as e:
+            print(f"Error en Properati al procesar un anuncio: {e}")
+            continue
+
+    return pd.DataFrame(results)
+
+# -------------------- Doomos --------------------
+def scrape_doomos(zona: str = "", dormitorios: str = "0", banos: str = "0",
+                  price_min: Optional[int] = None, price_max: Optional[int] = None,
+                  palabras_clave: str = ""):
+    driver = create_driver(headless=True)
+    results = []
+    try:
+        # Mapeo ACTUALIZADO de zonas a sus IDs específicos para Doomos
+        ZONA_IDS_CORRECTOS = {
+            "ancón": "-336912",
+            "ate": "-337679",
+            "breña": "65645345",
+            "carabayllo": "-339907",
+            "chaclacayo": "-341190",
+            "chorrillos": "-342811",
+            "cieneguilla": "-343329",
+            "comas": "-343903",
+            "el agustino": "-345552",
+            "jesús maría": "348294",
+            "la molina": "-351740",
+            "la victoria": "-352442",
+            "lima": "45343445",  # Cercado de Lima
+            "lince": "-352696",
+            "los olivos": "191126",
+            "lurigancho": "-353648",
+            "lurín": "-353652",
+            "magdalena del mar": "326245",
+            "miraflores": "-354864",
+            "pachacámac": "-356636",
+            "pucusana": "-359672",
+            "pueblo libre": "-359690",
+            "puente piedra": "-359759",
+            "punta hermosa": "-360186",
+            "punta negra": "-360189",
+            "rímac": "-361308",
+            "san bartolo": "-362154",
+            "san borja": "-362170",
+            "san isidro": "-362425",
+            "san luis": "-362738",
+            "san miguel": "-362804",
+            "santiago de surco": "-364705",
+            "surquillo": "-364723"
+        }
+
+        # Construir URL base CORRECTA para Doomos
+        base_url = "http://www.doomos.com.pe/search/"
+
+        # Parámetros base
+        params = {
+            "clase": "1",           # Departamentos
+            "stipo": "16",          # Alquiler
+            "pagina": "1",
+            "sort": "primeasc"
+        }
+
+        # Si NO se especifica zona, usar LIMA por defecto con el ID CORRECTO
+        if not zona or not zona.strip():
+            params["loc_name"] = "Lima (Región de Lima)"
+            params["loc_id"] = "-352647"  # ← ¡¡¡ESTA ES LA LÍNEA CORREGIDA!!!
+        else:
+            zona_lower = zona.strip().lower()
+            loc_id = ZONA_IDS_CORRECTOS.get(zona_lower, "")
+            zona_formateada = f"{zona.strip()} (Región de Lima)"
+            params["loc_name"] = zona_formateada
+            if loc_id:
+                params["loc_id"] = loc_id
+
+        # Agregar filtros opcionales
+        if dormitorios and dormitorios != "0":
+            params["piezas"] = dormitorios
+        if banos and banos != "0":
+            params["banos"] = banos
+        if price_min is not None:
+            params["preciomin"] = str(price_min)
+        if price_max is not None:
+            params["preciomax"] = str(price_max)
+        if palabras_clave and palabras_clave.strip():
+            params["keyword"] = palabras_clave.strip()
+
+        # Construir URL completa
+        url = base_url + "?" + "&".join(f"{k}={requests.utils.quote(str(v))}" for k,v in params.items())
+        print(f"URL de Doomos: {url}")
+
+        driver.get(url)
+        time.sleep(3)
+
+        # Scroll para cargar más resultados
+        for _ in range(3):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
+
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        cards = soup.select(".content_result")
+
+        if not cards:
+            print("No se encontraron cards en Doomos")
+            return pd.DataFrame()
+
+        print(f"Se encontraron {len(cards)} cards en Doomos")
+
+        for card in cards:
+            try:
+                # Extraer link y título
+                a_tag = card.select_one(".content_result_titulo a")
+                if not a_tag:
+                    continue
+
+                title = a_tag.get_text(" ", strip=True)
+                href = a_tag.get("href") or ""
+
+                # Construir URL completa si es relativa
+                if href and href.startswith("/"):
+                    href = "http://www.doomos.com.pe" + href
+
+                # Extraer precio
+                price_elem = card.select_one(".content_result_precio")
+                price = price_elem.get_text(" ", strip=True) if price_elem else ""
+
+                # Extraer descripción
+                desc_elem = card.select_one(".content_result_descripcion")
+                desc = desc_elem.get_text(" ", strip=True) if desc_elem else card.get_text(" ", strip=True)[:400]
+
+                # Extraer dormitorios, baños, m2 del texto
+                dormitorios_text = ""
+                banos_text = ""
+                m2_text = ""
+                text_content = card.get_text(" ", strip=True).lower()
+
+                dorm_match = re.search(r'(\d+)\s*dormitorio', text_content)
+                if dorm_match:
+                    dormitorios_text = dorm_match.group(1)
+
+                banos_match = re.search(r'(\d+)\s*baño', text_content)
+                if banos_match:
+                    banos_text = banos_match.group(1)
+
+                m2_match = re.search(r'(\d+)\s*m2', text_content)
+                if m2_match:
+                    m2_text = m2_match.group(1)
+
+                # EXTRAER IMAGEN DIRECTAMENTE DEL LISTADO (NO ENTRAR AL DETALLE)
+                img_url = ""
+                img_tag = card.select_one("img.content_result_image")
+                if img_tag:
+                    img_url = img_tag.get("src") or img_tag.get("data-src") or ""
+                    if img_url and img_url.startswith("//"):
+                        img_url = "https:" + img_url
+                    img_url = img_url.strip()
+
+                results.append({
+                    "titulo": title,
+                    "precio": price,
+                    "m2": m2_text,
+                    "dormitorios": dormitorios_text,
+                    "baños": banos_text,
+                    "descripcion": desc,
+                    "link": href,
+                    "imagen_url": img_url
+                })
+
+            except Exception as e:
+                print(f"Error procesando card en Doomos: {e}")
+                continue
+
+    except Exception as e:
+        print(f"Error en Doomos scraper: {e}")
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+    return pd.DataFrame(results)
+
+# -------------------- Filtrado y Unificación --------------------
+SCRAPERS = [
+    ("nestoria", scrape_nestoria),
+    ("infocasas", scrape_infocasas),
+    ("urbania", scrape_urbania),
+    ("properati", scrape_properati),
+    ("doomos", scrape_doomos),
+]
 
 def _filter_df_strict(df, dormitorios_req, banos_req, price_min, price_max):
     if df is None or df.empty:
         return pd.DataFrame()
     dfc = df.copy().reset_index(drop=True)
     dfc["_precio_soles"] = dfc["precio"].apply(_parse_price_soles)
-    dfc["_m2_num"] = dfc["m2"].apply(_extract_m2)
     dfc["_dorm_num"] = dfc["dormitorios"].apply(_extract_int_from_text)
     dfc["_banos_num"] = dfc["baños"].apply(_extract_int_from_text)
+
     mask = pd.Series(True, index=dfc.index)
-    mask &= dfc["titulo"].astype(str).str.strip().replace({"": False, "None": False}).apply(lambda x: bool(x))
-    mask &= dfc["link"].astype(str).str.strip().replace({"": False, "None": False}).apply(lambda x: bool(x))
-    mask &= dfc["precio"].astype(str).str.strip().replace({"": False, "None": False}).apply(lambda x: bool(x))
-    mask &= dfc["_m2_num"].notnull()
-    mask &= dfc["_dorm_num"].notnull()
-    mask &= dfc["_banos_num"].notnull()
+    # only require dorm/banos if user requested them
     try:
         if dormitorios_req is not None and str(dormitorios_req).strip() != "" and str(dormitorios_req) != "0":
             dorm_req_int = int(dormitorios_req)
-            mask &= (dfc["_dorm_num"] == dorm_req_int)
-    except Exception:
+            mask &= (dfc["_dorm_num"].notnull()) & (dfc["_dorm_num"] == dorm_req_int)
+    except:
         pass
     try:
         if banos_req is not None and str(banos_req).strip() != "" and str(banos_req) != "0":
             banos_req_int = int(banos_req)
-            mask &= (dfc["_banos_num"] == banos_req_int)
-    except Exception:
+            mask &= (dfc["_banos_num"].notnull()) & (dfc["_banos_num"] == banos_req_int)
+    except:
         pass
+
     if (price_min is not None) or (price_max is not None):
         if price_min is None:
             price_min = -10**12
@@ -1036,92 +1052,195 @@ def _filter_df_strict(df, dormitorios_req, banos_req, price_min, price_max):
             price_max = 10**12
         mask &= dfc["_precio_soles"].notnull()
         mask &= (dfc["_precio_soles"] >= int(price_min)) & (dfc["_precio_soles"] <= int(price_max))
+
     df_filtered = dfc.loc[mask].copy().reset_index(drop=True)
-    df_filtered.drop(columns=["_precio_soles","_m2_num","_dorm_num","_banos_num"], errors="ignore", inplace=True)
+    df_filtered.drop(columns=["_precio_soles","_dorm_num","_banos_num"], errors="ignore", inplace=True)
     return df_filtered
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# >>> NUEVA FUNCIÓN: FILTRADO SEMÁNTICO POR PALABRAS CLAVE <<<
 def _filter_by_keywords(df, palabras_clave: str):
-    """
-    Filtra el DataFrame para mantener solo las filas que contienen TODAS las palabras clave
-    en el texto combinado de: titulo + descripcion + m2 + dormitorios + baños.
-    """
-    if df.empty or not palabras_clave.strip():
+    if df is None or df.empty or not palabras_clave or not palabras_clave.strip():
         return df
     palabras = palabras_clave.lower().split()
-    # Crear columna combinada
-    df["texto_completo"] = (
-        df["titulo"].astype(str) + " " +
-        df["descripcion"].astype(str) + " " +
-        df["m2"].astype(str) + " " +
-        df["dormitorios"].astype(str) + " " +
-        df["baños"].astype(str)
+    dfc = df.copy()
+    dfc["texto_completo"] = (
+        dfc["titulo"].astype(str) + " " +
+        dfc.get("descripcion", pd.Series([""]*len(dfc))).astype(str) + " " +
+        dfc.get("m2", pd.Series([""]*len(dfc))).astype(str) + " " +
+        dfc.get("dormitorios", pd.Series([""]*len(dfc))).astype(str) + " " +
+        dfc.get("baños", pd.Series([""]*len(dfc))).astype(str)
     ).str.lower()
-    # Aplicar filtro: mantener solo filas que contengan TODAS las palabras
-    for palabra in palabras:
-        df = df[df["texto_completo"].str.contains(palabra, na=False, case=False)]
-    # Eliminar columna auxiliar
-    df.drop(columns=["texto_completo"], inplace=True, errors="ignore")
-    return df
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    for p in palabras:
+        dfc = dfc[dfc["texto_completo"].str.contains(re.escape(p), na=False, case=False)]
+    dfc.drop(columns=["texto_completo"], errors="ignore", inplace=True)
+    return dfc
 
-def run_scrapers(zona, dormitorios="0", banos="0", price_min=None, price_max=None, palabras_clave=""):
-    """
-    Ejecuta todos los scrapers y devuelve los resultados combinados
-    """
+def run_and_combine_all(zona: str = "", dormitorios: str = "0", banos: str = "0",
+                        price_min: Optional[int] = None, price_max: Optional[int] = None,
+                        palabras_clave: str = ""):
     frames = []
-    counts = {}
-    logger.info(f"🔎 Buscando en {zona} | dorms={dormitorios} | baños={banos} | precio={price_min}-{price_max} | palabras_clave='{palabras_clave}'")
+    counts_raw = {}
+    counts_after = {}
 
+    print(f"🔎 Buscando: zona='{zona}' | dorms={dormitorios} | baños={banos} | pmin={price_min} | pmax={price_max} | keywords='{palabras_clave}'")
     for name, func in SCRAPERS:
+        print(f"-> Ejecutando scraper: {name}")
         try:
-            df = func(zona, dormitorios, banos, price_min, price_max)
+            df = func(zona=zona, dormitorios=dormitorios, banos=banos, price_min=price_min, price_max=price_max, palabras_clave=palabras_clave)
+        except TypeError:
+            # backward compatibility: call with fewer args
+            try:
+                df = func(zona, dormitorios, banos, price_min, price_max)
+            except Exception as e:
+                print(f" ❌ Error ejecutando {name} (fallback):", e)
+                df = pd.DataFrame()
         except Exception as e:
-            logger.error(f"❌ Error en {name}: {e}")
+            print(f" ❌ Error ejecutando {name}:", e)
             df = pd.DataFrame()
 
-        if df is None:
-            df = pd.DataFrame()
+        if df is None or not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(columns=["titulo","precio","m2","dormitorios","baños","descripcion","link","imagen_url"])
 
-        # Asegurar que todas las columnas requeridas existan
-        required_columns = ["titulo","precio","m2","dormitorios","baños","descripcion","link","fuente","imagen_url"]
-        for col in required_columns:
+        # ensure columns present
+        for col in ["titulo","precio","m2","dormitorios","baños","descripcion","link","imagen_url"]:
             if col not in df.columns:
                 df[col] = ""
 
         total_raw = len(df)
-        counts[name] = total_raw
-        logger.info(f"Fuente: {name} -> encontrados: {total_raw}")
+        counts_raw[name] = total_raw
+        print(f"   encontrados (raw): {total_raw}")
 
+        # normalize
         df = df.fillna("").astype(object)
-        for col in required_columns:
+        for col in ["titulo","precio","m2","dormitorios","baños","descripcion","link","imagen_url"]:
             df[col] = df[col].astype(str).str.strip().replace({None: "", "None": ""})
 
-        # Aplicar filtro estricto
+        # strict filters (price/dorm/banos)
         df_filtered = _filter_df_strict(df, dormitorios, banos, price_min, price_max)
+        print(f"   después filtrado estricto: {len(df_filtered)}")
 
-        # Aplicar filtro por palabras clave
-        if palabras_clave.strip():
+        # keywords: apply post-scrape para fuentes que no lo usan en URL
+        if palabras_clave and palabras_clave.strip() and name not in ("urbania", "doomos"):
+            prev = len(df_filtered)
             df_filtered = _filter_by_keywords(df_filtered, palabras_clave)
+            print(f"   después filtrar por keywords: {len(df_filtered)} (eliminados {prev - len(df_filtered)})")
+
+        counts_after[name] = len(df_filtered)
 
         if len(df_filtered) > 0:
             df_filtered = df_filtered.copy()
-            df_filtered["scraped_at"] = datetime.now().isoformat()
-            df_filtered["id"] = [str(uuid.uuid4()) for _ in range(len(df_filtered))]
+            df_filtered["fuente"] = name
             frames.append(df_filtered)
 
     if not frames:
-        logger.warning("⚠️ Ninguna fuente devolvió anuncios")
+        print("⚠️ Ninguna fuente devolvió anuncios tras filtrar. Conteo raw:", counts_raw)
         return pd.DataFrame()
 
     combined = pd.concat(frames, ignore_index=True, sort=False)
+    # Eliminar filas donde el link empieza con "#" o está vacío
+    combined = combined[~combined["link"].str.startswith("#")].reset_index(drop=True)
+    combined = combined[combined["link"] != ""].reset_index(drop=True)
     combined = combined.drop_duplicates(subset=["link","titulo"], keep="first").reset_index(drop=True)
+
+    # mostrar (dinámico si IPython)
+    try:
+        from IPython.display import display
+        display_cols = ["fuente","titulo","precio","m2","dormitorios","baños","link","imagen_url"]
+        display(combined[display_cols])
+    except Exception:
+        display_cols = ["fuente","titulo","precio","m2","dormitorios","baños","link","imagen_url"]
+        print(combined[display_cols].to_string(index=False))
+
+    # guardar CSV
+    out_dir = "/mnt/data" if os.path.exists("/mnt/data") else os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "combined_anuncios_filtrados.csv")
+    combined.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print("CSV guardado en:", csv_path)
+
     return combined
 
-# Para uso como módulo
+# -------------------- Adapter para el backend (paginación y salida JSON) --------------------
+def _df_to_properties(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    cols = ["titulo","precio","m2","dormitorios","baños","descripcion","link","imagen_url","fuente"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    # Convertir a lista de dicts (strings limpios)
+    records = []
+    for _, row in df.iterrows():
+        records.append({
+            "titulo": str(row.get("titulo","") or "").strip(),
+            "precio": str(row.get("precio","") or "").strip(),
+            "m2": str(row.get("m2","") or "").strip(),
+            "dormitorios": str(row.get("dormitorios","") or "").strip(),
+            "baños": str(row.get("baños","") or "").strip(),
+            "descripcion": str(row.get("descripcion","") or "").strip(),
+            "link": str(row.get("link","") or "").strip(),
+            "imagen": str(row.get("imagen_url","") or "").strip(),
+            "fuente": str(row.get("fuente","") or "").strip()
+        })
+    return records
+
+def run_scrapers(
+    zona: str = "",
+    dormitorios: str = "0",
+    banos: str = "0",
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
+    palabras_clave: str = "",
+    page: int = 1,
+    limit: int = 20
+) -> Dict[str, Any]:
+    """
+    Hook para el backend (FastAPI).
+    - Ejecuta todos los scrapers con tus filtros del Colab.
+    - Aplica paginación server-side (page, limit).
+    - Devuelve un dict JSON-serializable con items + meta.
+    """
+    df = run_and_combine_all(
+        zona=zona,
+        dormitorios=dormitorios,
+        banos=banos,
+        price_min=price_min,
+        price_max=price_max,
+        palabras_clave=palabras_clave
+    )
+
+    items = _df_to_properties(df)
+    total = len(items)
+
+    # Paginación
+    page = max(1, int(page or 1))
+    limit = max(1, int(limit or 20))
+    start = (page - 1) * limit
+    end = start + limit
+    page_items = items[start:end]
+
+    return {
+        "items": page_items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "has_next": end < total,
+        "has_prev": start > 0
+    }
+
+# -------------------- CLI --------------------
 if __name__ == "__main__":
-    # Ejemplo de uso directo
-    resultados = run_scrapers("miraflores", "2", "1", 1000, 2000, "piscina")
-    print(f"Se encontraron {len(resultados)} propiedades")
-    print(resultados.head())
+    print("CONFIG: todos los filtros son opcionales. Dejar vacío para 'no filtrar' en ese campo.")
+    zona = input("👉 Zona (ej: comas) - vacío para todas: ").strip()
+    dormitorios = input("👉 Dormitorios (0 si no filtrar): ").strip() or "0"
+    banos = input("👉 Baños (0 si no filtrar): ").strip() or "0"
+    pmin = input("👉 Precio mínimo (solo números, 0 si no filtrar): ").strip() or "0"
+    pmax = input("👉 Precio máximo (solo números, 0 si no filtrar): ").strip() or "0"
+    palabras_clave = input("👉 Palabras clave (opcional, ej 'piscina mascotas jardin'): ").strip()
+
+    pmin_val = int(pmin) if pmin and pmin != "0" else None
+    pmax_val = int(pmax) if pmax and pmax != "0" else None
+
+    combined = run_and_combine_all(zona=zona, dormitorios=dormitorios, banos=banos,
+                                   price_min=pmin_val, price_max=pmax_val,
+                                   palabras_clave=palabras_clave)
+    print("Proceso finalizado. Resultados (tras filtrar):", len(combined))

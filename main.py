@@ -6,14 +6,15 @@ from datetime import datetime, timedelta
 import logging
 import threading
 import re
+import hashlib
 
-from scraper import run_scrapers  # <-- tu scraper actual
+from scraper import run_scrapers  # <-- hook del scraper (ya integrado con tu Colab)
 
 # ----------------- Logging -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Scraper de Alquileres API", version="2.4.0")
+app = FastAPI(title="Scraper de Alquileres API", version="2.5.0")
 
 # ----------------- CORS -----------------
 FRONTEND_ORIGINS = [
@@ -99,6 +100,45 @@ def paginate(items: List[dict], page: int, page_size: int) -> Tuple[List[dict], 
     )
     return slice_items, meta
 
+def _make_id(link: str, titulo: str, fuente: str) -> str:
+    raw = (link or "") + "|" + (titulo or "") + "|" + (fuente or "")
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def _normalize_item(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Asegura que cada item cumpla el contrato de Property:
+    - id
+    - imagen_url (mapea desde 'imagen' si llega así)
+    - fuente, scraped_at, y campos string
+    """
+    titulo = str(p.get("titulo", "") or "").strip()
+    precio = str(p.get("precio", "") or "").strip()
+    m2 = str(p.get("m2", "") or "").strip()
+    dormitorios = str(p.get("dormitorios", "") or "").strip()
+    banos = str(p.get("baños", "") or "").strip()
+    descripcion = str(p.get("descripcion", "") or "").strip()
+    link = str(p.get("link", "") or "").strip()
+    fuente = str(p.get("fuente", "") or "").strip()
+    imagen_url = str(p.get("imagen_url", p.get("imagen", "")) or "").strip()
+
+    pid = _make_id(link, titulo, fuente)
+    scraped_at = datetime.utcnow().isoformat()
+
+    return {
+        "id": pid,
+        "titulo": titulo,
+        "precio": precio,
+        "m2": m2,
+        "dormitorios": dormitorios,
+        "baños": banos,
+        "descripcion": descripcion,
+        "link": link,
+        "fuente": fuente,
+        "scraped_at": scraped_at,
+        "imagen_url": imagen_url,
+        "is_featured": bool(p.get("is_featured", False)),
+    }
+
 def run_search(
     zona: str,
     dormitorios: str,
@@ -107,21 +147,37 @@ def run_search(
     price_max: Optional[int],
     palabras_clave: str,
 ) -> List[dict]:
-    results = run_scrapers(
-        zona=zona,
-        dormitorios=dormitorios,
-        banos=banos,
-        price_min=price_min,
-        price_max=price_max,
-        palabras_clave=palabras_clave
-    )
-    if results is None:
+    """
+    Llama al hook del scraper y devuelve TODOS los items (sin paginar)
+    normalizados al contrato Property (excepto is_featured que se marca luego).
+    """
+    try:
+        # Pedimos una "página grande" para traer el universo y paginar en el API.
+        res = run_scrapers(
+            zona=zona,
+            dormitorios=dormitorios,
+            banos=banos,
+            price_min=price_min,
+            price_max=price_max,
+            palabras_clave=palabras_clave,
+            page=1,
+            limit=1000,  # tope alto para no quedarnos cortos
+        )
+    except Exception as e:
+        logger.warning(f"run_scrapers falló: {e}")
         return []
-    if hasattr(results, "to_dict"):
-        return results.to_dict("records")
-    if isinstance(results, list):
-        return results
-    return []
+
+    # El hook puede devolver dict con {"items": [...]} o lista directa.
+    if isinstance(res, dict) and "items" in res:
+        raw_items = res.get("items") or []
+    elif isinstance(res, list):
+        raw_items = res
+    else:
+        raw_items = []
+
+    # Normalizamos al shape que exige Property
+    norm = [_normalize_item(p) for p in raw_items if isinstance(p, dict)]
+    return norm
 
 # ----------------- Heurística de "destacado" -----------------
 FEATURE_KEYWORDS = [
