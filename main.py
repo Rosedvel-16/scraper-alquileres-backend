@@ -148,34 +148,53 @@ def run_search(
     palabras_clave: str,
 ) -> List[dict]:
     """
-    Llama al hook del scraper y devuelve TODOS los items (sin paginar)
-    normalizados al contrato Property (excepto is_featured que se marca luego).
+    Llama al scraper y normaliza la salida (acepta DataFrame, dict o list).
     """
     try:
-        # Pedimos una "página grande" para traer el universo y paginar en el API.
-        res = run_scrapers(
-            zona=zona,
-            dormitorios=dormitorios,
-            banos=banos,
-            price_min=price_min,
-            price_max=price_max,
-            palabras_clave=palabras_clave,
-            page=1,
-            limit=1000,  # tope alto para no quedarnos cortos
-        )
+        # 1) Intento con page/limit (si tu run_scrapers los soporta)
+        try:
+            res = run_scrapers(
+                zona=zona,
+                dormitorios=dormitorios,
+                banos=banos,
+                price_min=price_min,
+                price_max=price_max,
+                palabras_clave=palabras_clave,
+                page=1,
+                limit=1000,
+            )
+        except TypeError:
+            # 2) Fallback a la firma clásica
+            res = run_scrapers(
+                zona=zona,
+                dormitorios=dormitorios,
+                banos=banos,
+                price_min=price_min,
+                price_max=price_max,
+                palabras_clave=palabras_clave,
+            )
     except Exception as e:
         logger.warning(f"run_scrapers falló: {e}")
         return []
 
-    # El hook puede devolver dict con {"items": [...]} o lista directa.
-    if isinstance(res, dict) and "items" in res:
-        raw_items = res.get("items") or []
-    elif isinstance(res, list):
-        raw_items = res
-    else:
+    # ---- Adaptar formatos
+    raw_items: List[Dict[str, Any]] = []
+    try:
+        # a) pandas.DataFrame
+        if hasattr(res, "to_dict"):
+            raw_items = res.to_dict("records")
+        # b) dict con items
+        elif isinstance(res, dict) and "items" in res:
+            raw_items = res.get("items") or []
+        # c) lista directa
+        elif isinstance(res, list):
+            raw_items = res
+        else:
+            raw_items = []
+    except Exception:
         raw_items = []
 
-    # Normalizamos al shape que exige Property
+    # ---- Normalizar a contrato Property
     norm = [_normalize_item(p) for p in raw_items if isinstance(p, dict)]
     return norm
 
