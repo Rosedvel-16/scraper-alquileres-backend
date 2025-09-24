@@ -57,7 +57,6 @@ FRONTEND_ORIGINS = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
@@ -447,8 +446,5 @@ def seed_admin(db: DBSession = Depends(get_db)):
 
 # ----------------- Ejecución local -----------------
 if __name__ == "__main__":
-    import uvicorn
-    print("🚀 Iniciando servidor FastAPI...")
-    print("📍 URL: http://localhost:8000")
-    print("📚 Documentación: http://localhost:8000/docs")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    import os, uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
