@@ -1,8 +1,7 @@
-fastapi
-uvicorn[standard]
-selenium
-webdriver-manager
-beautifulsoup4
-pandas
-requests
-python-dotenv
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+SQLAlchemy==2.0.32
+python-multipart==0.0.9
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+pydantic==2.8.2

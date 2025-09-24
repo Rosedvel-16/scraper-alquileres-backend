@@ -43,29 +43,13 @@ def create_driver(headless: bool = True):
     options.add_argument("--window-size=1920,1080")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
-
-    # ¡¡¡CRÍTICO: Especificar la ruta de Chrome en entornos serverless!!!
-    # Muchos servidores usan Chromium en lugar de Chrome.
-    chrome_path = os.environ.get("CHROME_PATH", None)
-    if chrome_path:
-        options.binary_location = chrome_path
-
-    try:
-        # Intentar instalar y obtener el driver
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-    except Exception as e:
-        logger.error(f"❌ FATAL: No se pudo inicializar ChromeDriver. Error: {str(e)}")
-        # Lanzar una excepción explícita para que el scraper falle y se registre.
-        raise RuntimeError(f"Driver initialization failed: {str(e)}")
-
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
     except Exception:
         pass
-
     return driver
 
 def slugify_zone(zona: str) -> str:
@@ -1046,15 +1030,15 @@ def run_scrapers(zona: str = "", dormitorios: str = "0", banos: str = "0",
         try:
             df = func(zona=zona, dormitorios=dormitorios, banos=banos, price_min=price_min, price_max=price_max, palabras_clave=palabras_clave)
         except TypeError:
-            # backward compatibility
+            # backward compatibility: call with fewer args
             try:
                 df = func(zona, dormitorios, banos, price_min, price_max)
             except Exception as e:
                 logger.error(f" ❌ Error ejecutando {name} (fallback): {e}")
                 df = pd.DataFrame()
         except Exception as e:
-            logger.error(f" ❌ Error CRÍTICO ejecutando {name}: {e}")
-            df = pd.DataFrame() # <- Esto es lo que causa que solo se vea Properati
+            logger.error(f" ❌ Error ejecutando {name}: {e}")
+            df = pd.DataFrame()
         if df is None or not isinstance(df, pd.DataFrame):
             df = pd.DataFrame(columns=["titulo","precio","m2","dormitorios","baños","descripcion","link","imagen_url"])
         # ensure columns present

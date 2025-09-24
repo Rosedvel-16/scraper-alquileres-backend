@@ -1,19 +1,53 @@
-from fastapi import FastAPI, HTTPException, Query
+import os, sys
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+from fastapi import FastAPI, HTTPException, Query, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta
 import logging
 import threading
 import re
+import os
+
+from sqlalchemy.orm import Session as DBSession
 
 from scraper import run_scrapers  # <-- tu scraper actual
+
+# --- NUEVO: admin/auth/db ---
+from db import engine, get_db
+from models import Base, User, RoleEnum
+from auth import (
+    login_handler, refresh_handler, logout_handler,
+    get_current_user, require_role, hash_password
+)
+try:
+    from admin_routes import router as admin_router
+except ModuleNotFoundError:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("admin_routes", os.path.join(BASE_DIR, "admin_routes.py"))
+    admin_routes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(admin_routes)
+    admin_router = admin_routes.router
+
+try:
+    from routes_public import pub
+except ModuleNotFoundError:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("routes_public", os.path.join(BASE_DIR, "routes_public.py"))
+    routes_public = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(routes_public)
+    pub = routes_public.pub
+
 
 # ----------------- Logging -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Scraper de Alquileres API", version="2.4.0")
+app = FastAPI(title="Scraper de Alquileres API", version="3.0.0")  # subimos versión
 
 # ----------------- CORS -----------------
 FRONTEND_ORIGINS = [
@@ -30,11 +64,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- NUEVO: crear tablas (SQLite/dev) ---
+Base.metadata.create_all(bind=engine)
+
 # ----------------- Paginación -----------------
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 20  # tope duro
 
-# ----------------- Modelos -----------------
+# ----------------- Modelos (Pydantic públicos) -----------------
 class Property(BaseModel):
     id: str
     titulo: str
@@ -130,24 +167,21 @@ FEATURE_KEYWORDS = [
 ]
 
 def score_property(p: Dict[str, Any]) -> float:
-    """Más puntos si menciona amenities y si el precio (en S/) es menor."""
     score = 0.0
     text = f"{p.get('titulo','')} {p.get('descripcion','')}".lower()
     for kw in FEATURE_KEYWORDS:
         if kw in text:
             score += 1.0
 
-    # precio en soles
     s = str(p.get("precio", ""))
     nums = re.sub(r"[^\d]", "", s)
     if s.strip().upper().startswith("S") and nums:
         try:
             val = int(nums)
-            score += max(0.0, 3000.0 / max(val, 1))  # cuanto más bajo, mayor score
+            score += max(0.0, 3000.0 / max(val, 1))
         except:
             pass
 
-    # m2 (si lo hay)
     m2txt = str(p.get("m2", ""))
     m2m = re.search(r"(\d{1,4})", m2txt)
     if m2m:
@@ -159,7 +193,6 @@ def score_property(p: Dict[str, Any]) -> float:
     return score
 
 def mark_featured_one(items: List[dict]) -> List[dict]:
-    """Marca exactamente 1 item con is_featured=True dentro de 'items'."""
     if not items:
         return items
     best_idx = None
@@ -241,6 +274,19 @@ async def list_sources():
     sources = ["nestoria", "infocasas", "urbania", "properati", "doomos"]
     return {"sources": sources}
 
+# ---------- AUTH (NUEVO) ----------
+@app.post("/auth/login")
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: DBSession = Depends(get_db)):
+    return login_handler(request, form_data, db)
+
+@app.post("/auth/refresh")
+def refresh(token: str = Body(embed=True), db: DBSession = Depends(get_db)):
+    return refresh_handler(db, token)
+
+@app.post("/auth/logout")
+def logout(token: str = Body(embed=True), db: DBSession = Depends(get_db)):
+    return logout_handler(db, token)
+
 # ----------------- Endpoints de búsqueda -----------------
 @app.post("/search", response_model=SearchResponse)
 async def search_properties_post(
@@ -270,15 +316,9 @@ async def search_properties_post(
                                   message="No se encontraron propiedades que coincidan con los criterios")
 
         page_items, meta = paginate(properties_all, page, page_size)
-        page_items = mark_featured_one(page_items)  # ✅ 1 destacado por página
-
-        return SearchResponse(
-            success=True,
-            count=len(page_items),
-            properties=page_items,
-            meta=meta,
-            message=f"Se encontraron {meta.total} propiedades"
-        )
+        page_items = mark_featured_one(page_items)
+        return SearchResponse(success=True, count=len(page_items), properties=page_items, meta=meta,
+                              message=f"Se encontraron {meta.total} propiedades")
     except Exception as e:
         logger.exception("Error en búsqueda POST")
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
@@ -301,12 +341,8 @@ async def search_properties_get(
         record_search(zona, dormitorios, banos, price_min, price_max, palabras_clave)
 
         properties_all = run_search(
-            zona=zona,
-            dormitorios=dormitorios,
-            banos=banos,
-            price_min=price_min,
-            price_max=price_max,
-            palabras_clave=palabras_clave
+            zona=zona, dormitorios=dormitorios, banos=banos,
+            price_min=price_min, price_max=price_max, palabras_clave=palabras_clave
         )
 
         if not properties_all:
@@ -315,15 +351,9 @@ async def search_properties_get(
                                   message="No se encontraron propiedades que coincidan con los criterios")
 
         page_items, meta = paginate(properties_all, page, page_size)
-        page_items = mark_featured_one(page_items)  # ✅ 1 destacado por página
-
-        return SearchResponse(
-            success=True,
-            count=len(page_items),
-            properties=page_items,
-            meta=meta,
-            message=f"Se encontraron {meta.total} propiedades"
-        )
+        page_items = mark_featured_one(page_items)
+        return SearchResponse(success=True, count=len(page_items), properties=page_items, meta=meta,
+                              message=f"Se encontraron {meta.total} propiedades")
     except Exception as e:
         logger.exception("Error en búsqueda GET")
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
@@ -331,7 +361,6 @@ async def search_properties_get(
 # ----------------- Endpoint: consultas más buscadas -----------------
 @app.get("/trending")
 async def trending(limit: int = Query(6, ge=1, le=20)):
-    """Devuelve combinaciones de búsqueda reales, ordenadas por frecuencia."""
     with STATS_LOCK:
         items = sorted(SEARCH_STATS.items(), key=lambda kv: kv[1], reverse=True)[:limit]
     payload = []
@@ -344,18 +373,10 @@ async def trending(limit: int = Query(6, ge=1, le=20)):
 # ----------------- Endpoint: home-feed (9 destacados reales) -----------------
 @app.get("/home-feed")
 async def home_feed():
-    """
-    Devuelve destacados reales para la portada.
-    - Usa top 'trending' si existen; si no, zonas fallback.
-    - Ejecuta búsquedas reales, crea un pool, lo deduplica y selecciona las 9 con mejor score.
-    - Marca cada una con is_featured=True.
-    - También devuelve 'sections' por compatibilidad con el front actual.
-    """
     cached = get_home_cached()
     if cached:
         return cached
 
-    # 1) Queries base
     with STATS_LOCK:
         sorted_stats = sorted(SEARCH_STATS.items(), key=lambda kv: kv[1], reverse=True)
     base_queries = [parse_stats_key(key) for key, _ in sorted_stats[:3]]
@@ -367,7 +388,6 @@ async def home_feed():
             {"zona": "santiago de surco", "dormitorios": "0", "banos": "0", "price_min": None, "price_max": None, "palabras_clave": ""},
         ]
 
-    # 2) Ejecutar búsquedas y armar pool + secciones
     pool: List[dict] = []
     sections = []
     for q in base_queries:
@@ -380,7 +400,6 @@ async def home_feed():
                 price_max=q["price_max"],
                 palabras_clave=q["palabras_clave"]
             )
-            # limitar cada sección a 6 para no sobrecargar
             subset = items[:6]
             sections.append({
                 "title": f"{q['zona'].title()}",
@@ -388,11 +407,10 @@ async def home_feed():
                 "count": len(subset),
                 "properties": subset
             })
-            pool.extend(items[:20])  # tomar hasta 20 por zona para el pool
+            pool.extend(items[:20])
         except Exception as e:
             logger.warning(f"home-feed sección falló para {q}: {e}")
 
-    # 3) Dedup + score -> top 9
     pool = dedupe_by_link(pool)
     scored = [(score_property(p), p) for p in pool]
     scored.sort(key=lambda t: t[0], reverse=True)
@@ -401,13 +419,31 @@ async def home_feed():
         p["is_featured"] = True
 
     payload = {
-        "featured": featured,           # ✅ arreglo de 9 destacados
-        "sections": sections,           # compatibilidad
+        "featured": featured,
+        "sections": sections,
         "generated_at": datetime.utcnow().isoformat(),
         "cached_ttl_minutes": int(HOME_CACHE_TTL.total_seconds() // 60),
     }
     set_home_cached(payload)
     return payload
+
+# ---------- Admin protegido (ping de prueba) ----------
+@app.get("/admin/ping", dependencies=[Depends(require_role(RoleEnum.ADMIN))])
+def admin_ping(user=Depends(get_current_user)):
+    return {"ok": True, "user": user.email, "role": user.role.value}
+
+# ---------- Montar routers (admin + público para métricas de vistas) ----------
+app.include_router(admin_router)  # /admin/*
+app.include_router(pub)           # /property/{pid} registra vistas
+
+# ---------- Seed opcional para crear superadmin ----------
+@app.post("/dev/seed-admin")
+def seed_admin(db: DBSession = Depends(get_db)):
+    if db.query(User).filter(User.email=="admin@local").first():
+        return {"msg":"ya existe"}
+    u = User(email="admin@local", password_hash=hash_password("admin123"), role=RoleEnum.ADMIN)
+    db.add(u); db.commit()
+    return {"ok": True, "email": u.email}
 
 # ----------------- Ejecución local -----------------
 if __name__ == "__main__":

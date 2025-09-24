@@ -1,0 +1,25 @@
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.python-version
+
+# ── Entornos ───────────────────────────────────────────
+venv/
+.venv/
+
+# ── Config/secretos ────────────────────────────────────
+.env
+
+# ── Archivos locales/BD ────────────────────────────────
+*.db
+data.db
+*.sqlite3
+
+# ── SO/Editor ──────────────────────────────────────────
+.DS_Store
+.vscode/
