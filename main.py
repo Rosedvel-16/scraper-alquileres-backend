@@ -416,3 +416,40 @@ if __name__ == "__main__":
     print("📍 URL: http://localhost:8000")
     print("📚 Documentación: http://localhost:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
+#---------------------------qwen------------------------------
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Permitir CORS para tu frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, restringe a tu dominio
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/scrape")
+def scrape_endpoint(
+    zona: str = "",
+    dormitorios: str = "0",
+    banos: str = "0",
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
+    palabras_clave: str = "",
+    page: int = 1,
+    limit: int = 20
+):
+    return run_scrapers(
+        zona=zona,
+        dormitorios=dormitorios,
+        banos=banos,
+        price_min=price_min,
+        price_max=price_max,
+        palabras_clave=palabras_clave,
+        page=page,
+        limit=limit
+    )

@@ -22,7 +22,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -36,36 +35,24 @@ def create_driver(headless: bool = True):
     options = Options()
     if headless:
         options.add_argument("--headless=new")
-    options.add_argument(f"user-agent={COMMON_UA}")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--disable-images")  # opcional: acelera
+    options.add_argument("--blink-settings=imagesEnabled=false")  # opcional
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
-
-    # ¡¡¡CRÍTICO: Especificar la ruta de Chrome en entornos serverless!!!
-    # Muchos servidores usan Chromium en lugar de Chrome.
-    chrome_path = os.environ.get("CHROME_PATH", None)
-    if chrome_path:
-        options.binary_location = chrome_path
-
-    try:
-        # Intentar instalar y obtener el driver
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-    except Exception as e:
-        logger.error(f"❌ FATAL: No se pudo inicializar ChromeDriver. Error: {str(e)}")
-        # Lanzar una excepción explícita para que el scraper falle y se registre.
-        raise RuntimeError(f"Driver initialization failed: {str(e)}")
-
+    # NO usamos ChromeDriverManager → asumimos que chromedriver está en PATH
+    driver = webdriver.Chrome(options=options)
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
     except Exception:
         pass
-
     return driver
 
 def slugify_zone(zona: str) -> str:

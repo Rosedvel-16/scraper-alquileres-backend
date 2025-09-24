@@ -1,8 +1,7 @@
-fastapi
-uvicorn[standard]
-selenium
-webdriver-manager
-beautifulsoup4
-pandas
-requests
-python-dotenv
+fastapi==0.111.0
+uvicorn==0.29.0
+selenium==4.21.0
+beautifulsoup4==4.12.3
+requests==2.31.0
+pandas==2.2.2
+python-multipart==0.0.9
