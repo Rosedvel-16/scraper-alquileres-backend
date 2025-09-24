@@ -1,9 +1,10 @@
 # models.py
+from db import Base
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Enum, Float
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import relationship
 import enum
 
 Base = declarative_base()
