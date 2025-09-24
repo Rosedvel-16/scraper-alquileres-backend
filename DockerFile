@@ -1,5 +1,5 @@
 # Usa una imagen base con Chrome preinstalado
-FROM python:3.11-slim
+FROM python:3.11.9-slim
 
 # Instalar dependencias del sistema
 RUN apt-get update && \
