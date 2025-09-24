@@ -1,25 +1,27 @@
+# Usa Python 3.11.9 explícito
 FROM python:3.11.9-slim
 
-# Instalar Chrome y dependencias
+# Instalar dependencias del sistema y Chrome
 RUN apt-get update && \
-    apt-get install -y wget gnupg ca-certificates unzip && \
+    apt-get install -y wget gnupg ca-certificates unzip curl && \
     wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
     echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list && \
     apt-get update && \
     apt-get install -y google-chrome-stable && \
     rm -rf /var/lib/apt/lists/*
 
-# Instalar chromedriver
-RUN CHROMEDRIVER_VERSION=`curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE` && \
+# Instalar chromedriver compatible
+RUN CHROMEDRIVER_VERSION=$(curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE_114) && \
     wget -N http://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip && \
     unzip chromedriver_linux64.zip && \
     chmod +x chromedriver && \
     mv chromedriver /usr/local/bin/
 
-# Entorno Python
+# Configurar entorno Python
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
