@@ -1,7 +1,8 @@
 fastapi
-uvicorn
-pydantic
-python-multipart
-# Para la conexión a la base de datos en Vercel
-SQLAlchemy
-psycopg2-binary # o mysql-connector-python
+uvicorn[standard]
+selenium
+webdriver-manager
+beautifulsoup4
+pandas
+requests
+python-dotenv
